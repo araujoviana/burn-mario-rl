@@ -155,6 +155,10 @@ impl MarioEnv {
         Ok(&self.obs)
     }
 
+    pub fn max_x(&self) -> u16 {
+        self.max_x
+    }
+
     pub fn observation(&self) -> &[u8] {
         &self.obs
     }
