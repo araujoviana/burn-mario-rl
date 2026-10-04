@@ -57,11 +57,11 @@ fn x_pos(emu: &Emulator) -> u16 {
     u16::from_le_bytes([r[RAM_PLAYER_X], r[RAM_PLAYER_X + 1]])
 }
 
-fn game_mode(emu: &Emulator) -> u8 {
+pub(crate) fn game_mode(emu: &Emulator) -> u8 {
     emu.ram()[RAM_GAME_MODE]
 }
 
-fn hold(emu: &mut Emulator, mask: u16, frames: u32) {
+pub(crate) fn hold(emu: &mut Emulator, mask: u16, frames: u32) {
     emu.set_buttons(mask);
     for _ in 0..frames {
         emu.run_frame();
@@ -69,7 +69,7 @@ fn hold(emu: &mut Emulator, mask: u16, frames: u32) {
 }
 
 /// Hold `mask` (or tap it when `tap`) until `done` is true, failing after `max` frames.
-fn drive(emu: &mut Emulator, mask: u16, tap: bool, max: u32, done: impl Fn(&Emulator) -> bool) -> Result<(), String> {
+pub(crate) fn drive(emu: &mut Emulator, mask: u16, tap: bool, max: u32, done: impl Fn(&Emulator) -> bool) -> Result<(), String> {
     for f in 0..max {
         if done(emu) {
             emu.set_buttons(0);
@@ -81,8 +81,8 @@ fn drive(emu: &mut Emulator, mask: u16, tap: bool, max: u32, done: impl Fn(&Emul
     Err(format!("boot script timed out (mode {:#04x})", game_mode(emu)))
 }
 
-/// Play the menus from power-on to the first frame of the first level and return a save state there.
-pub fn level_start_state(emu: &mut Emulator) -> Result<Vec<u8>, String> {
+/// Boot to the overworld just outside Yoshi's House, standing before the first level.
+fn boot_to_overworld(emu: &mut Emulator) -> Result<(), String> {
     hold(emu, 0, 600); // ROM intro is black for ~5 s
     drive(emu, button::START, true, 3000, |e| game_mode(e) == MODE_OVERWORLD)?; // title -> intro -> map
     hold(emu, 0, 60);
@@ -92,7 +92,24 @@ pub fn level_start_state(emu: &mut Emulator) -> Result<Vec<u8>, String> {
     hold(emu, 0, 300); // path to the next node opens
     hold(emu, button::RIGHT, 40); // walk to the first level
     hold(emu, 0, 200);
-    drive(emu, button::A, true, 600, |e| game_mode(e) == MODE_IN_LEVEL)?;
+    Ok(())
+}
+
+/// Save state on the overworld, before the first level is entered. Source for `ram::warp_to_level`.
+pub fn overworld_state(emu: &mut Emulator) -> Result<Vec<u8>, String> {
+    boot_to_overworld(emu)?;
+    emu.save_state()
+}
+
+/// Press A until the game enters a level.
+pub(crate) fn drive_to_level(emu: &mut Emulator, max: u32) -> Result<(), String> {
+    drive(emu, button::A, true, max, |e| game_mode(e) == MODE_IN_LEVEL)
+}
+
+/// Play the menus from power-on to the first frame of the first level and return a save state there.
+pub fn level_start_state(emu: &mut Emulator) -> Result<Vec<u8>, String> {
+    boot_to_overworld(emu)?;
+    drive_to_level(emu, 600)?;
     hold(emu, 0, 60); // let the level fade in and Mario land
     emu.save_state()
 }

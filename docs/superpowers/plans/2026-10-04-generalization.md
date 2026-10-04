@@ -10,10 +10,21 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-04-generalization-design.md`
 
+## Task 1 outcome (done, 2026-10-04)
+
+The spike finished and changed the warp mechanism, so Tasks 2 and 4 below are written for the real one:
+
+- Writing the translevel (`$13BF`) or the level number (`$010B`, `$0E`) during the load modes does **nothing**: the game derives both from the **overworld cursor position** in the frame A is pressed.
+- What works: load the overworld state, write the cursor (`$1F17` X, `$1F19` Y, 16 bit pixels), press A. Scanning a 32x32 tile grid (positions `tile*16+8`) enters **40 distinct levels**, 5 vertical. The cursor start (152,136) is the level we already use.
+- Non-level tiles either never leave the map or load a blank "level" with timer 0; `warp_to_position` rejects those.
+- Timer ticks every **41** emulator frames (`TIMER_TICK_FRAMES = 41`). Timers seen: 199, 299, 399.
+- Verified in `ram.rs`: Mario X/Y, signed speeds, `blocked & 4` = on ground, vertical flag `$5B & 1`, timer digits `$0F31-33`, sprite tables. `examples/warp_probe.rs` reproduces all of it.
+- API that exists now: `Emulator::write_ram`, `env::overworld_state`, `ram::warp_to_position(emu, overworld, x, y) -> Result<Vec<u8>, String>`.
+
 ## Global Constraints
 
 - Level pool: 15+ levels, 3-4 held out for a generalization score. If fewer than 15 pass the filter in Task 2, keep going and report the real number.
-- Level start states come from a RAM warp from the overworld, not per-level menu scripting.
+- Level start states come from a RAM warp from the overworld (cursor teleport, see Task 1 outcome), not per-level menu scripting.
 - Entity RAM enters the network as a vector branch fused with the CNN features (not extra image channels).
 - Every new feature is behind a config flag so it can be ablated. PLR off = uniform sampling.
 - Pool is limited to horizontal levels with a goal gate (layout flag filter).
@@ -50,236 +61,9 @@
 
 ---
 
-### Task 1: Spike - RAM addresses and the level warp
+### Task 1: Spike - RAM addresses and the level warp (DONE)
 
-This is exploratory. Its deliverable is `src/ram.rs` with verified addresses and a working `warp_to_level` function. Later tasks depend on it. If the warp cannot be made to work after a serious attempt, STOP and report to the user (fallback in the spec: scripted overworld walks, fewer levels).
-
-**Files:**
-- Modify: `src/emulator.rs` (add `write_ram`)
-- Modify: `src/env.rs` (split `level_start_state`; add `overworld_state`)
-- Create: `src/ram.rs`, `examples/warp_probe.rs`
-- Modify: `src/lib.rs`
-
-**Interfaces:**
-- Produces: `Emulator::write_ram(&mut self, offset: usize, data: &[u8])`
-- Produces: `env::overworld_state(emu: &mut Emulator) -> Result<Vec<u8>, String>` (save state on the overworld right after leaving Yoshi's House, before entering level 1)
-- Produces: `ram::warp_to_level(emu: &mut Emulator, overworld: &[u8], translevel: u8) -> Result<Vec<u8>, String>` (returns a save state at the first controllable frame of that level)
-- Produces constants in `ram.rs` used by later tasks (see Step 4).
-
-- [ ] **Step 1: Add `write_ram` to the emulator**
-
-In `src/emulator.rs`, after `ram()`:
-
-```rust
-    /// Overwrite work RAM at `offset` (`$7E0000 + offset`).
-    pub fn write_ram(&mut self, offset: usize, data: &[u8]) {
-        unsafe {
-            let ptr = (self.get_memory_data)(MEMORY_SYSTEM_RAM) as *mut u8;
-            let len = (self.get_memory_size)(MEMORY_SYSTEM_RAM);
-            assert!(!ptr.is_null() && offset + data.len() <= len, "write_ram out of range");
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
-        }
-    }
-```
-
-- [ ] **Step 2: Split the boot script**
-
-In `src/env.rs`, replace `level_start_state` with two functions. `overworld_state` runs the existing script up to and including `hold(emu, 0, 200);` that follows "walk to the first level" (stop before the final `drive(... MODE_IN_LEVEL)`), then returns `emu.save_state()`. `level_start_state` calls the same script and finishes as before. Concretely:
-
-```rust
-/// Boot to the overworld just outside Yoshi's House, standing before the first level.
-fn boot_to_overworld(emu: &mut Emulator) -> Result<(), String> {
-    hold(emu, 0, 600); // ROM intro is black for ~5 s
-    drive(emu, button::START, true, 3000, |e| game_mode(e) == MODE_OVERWORLD)?; // title -> intro -> map
-    hold(emu, 0, 60);
-    drive(emu, button::A, true, 600, |e| game_mode(e) == MODE_IN_LEVEL)?; // enter Yoshi's House
-    hold(emu, 0, 30);
-    drive(emu, button::RIGHT, false, 1200, |e| game_mode(e) == MODE_OVERWORLD)?; // walk out of the house
-    hold(emu, 0, 300); // path to the next node opens
-    hold(emu, button::RIGHT, 40); // walk to the first level
-    hold(emu, 0, 200);
-    Ok(())
-}
-
-/// Save state on the overworld, before the first level is entered. Source for `ram::warp_to_level`.
-pub fn overworld_state(emu: &mut Emulator) -> Result<Vec<u8>, String> {
-    boot_to_overworld(emu)?;
-    emu.save_state()
-}
-
-/// Play the menus from power-on to the first frame of the first level and return a save state there.
-pub fn level_start_state(emu: &mut Emulator) -> Result<Vec<u8>, String> {
-    boot_to_overworld(emu)?;
-    drive(emu, button::A, true, 600, |e| game_mode(e) == MODE_IN_LEVEL)?;
-    hold(emu, 0, 60); // let the level fade in and Mario land
-    emu.save_state()
-}
-```
-
-Make `game_mode`, `hold` and `drive` `pub(crate)`.
-
-- [ ] **Step 3: Create `src/ram.rs` with candidate addresses and the probe**
-
-```rust
-//! Super Mario World work-RAM addresses (offsets from $7E0000) and decoding helpers.
-//! Every address here was checked with `examples/warp_probe.rs`; see the comments for how.
-
-use crate::emulator::Emulator;
-use crate::env::{drive_to_level, game_mode};
-
-pub const GAME_MODE: usize = 0x100;
-pub const PLAYER_STATE: usize = 0x71;
-pub const PLAYER_X: usize = 0x94; // 16 bit
-pub const PLAYER_Y: usize = 0x96; // 16 bit
-pub const PLAYER_SPEED_X: usize = 0x7B; // signed
-pub const PLAYER_SPEED_Y: usize = 0x7D; // signed
-pub const PLAYER_BLOCKED: usize = 0x77; // bit 2 set = standing on something
-pub const POWERUP: usize = 0x19;
-pub const TRANSLEVEL: usize = 0x13BF;
-pub const END_LEVEL_TIMER: usize = 0x1493;
-pub const LAYOUT_FLAGS: usize = 0x5B; // bit 0 set = vertical level
-pub const TIMER_HUNDREDS: usize = 0xF31;
-pub const TIMER_TENS: usize = 0xF32;
-pub const TIMER_ONES: usize = 0xF33;
-
-pub const SPRITE_SLOTS: usize = 12;
-pub const SPRITE_STATUS: usize = 0x14C8; // 0 = empty slot
-pub const SPRITE_TYPE: usize = 0x9E;
-pub const SPRITE_X_LO: usize = 0xE4;
-pub const SPRITE_X_HI: usize = 0x14E0;
-pub const SPRITE_Y_LO: usize = 0xD8;
-pub const SPRITE_Y_HI: usize = 0x14D4;
-
-pub fn u16_at(ram: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([ram[offset], ram[offset + 1]])
-}
-
-/// In-game countdown timer, 0..=999.
-pub fn timer(ram: &[u8]) -> u32 {
-    ram[TIMER_HUNDREDS] as u32 * 100 + ram[TIMER_TENS] as u32 * 10 + ram[TIMER_ONES] as u32
-}
-
-pub fn is_vertical(ram: &[u8]) -> bool {
-    ram[LAYOUT_FLAGS] & 1 != 0
-}
-```
-
-Add `pub mod ram;` to `src/lib.rs`. In `src/env.rs` add a `pub(crate) fn drive_to_level(emu: &mut Emulator, max: u32) -> Result<(), String>` that is `drive(emu, button::A, true, max, |e| game_mode(e) == MODE_IN_LEVEL)`.
-
-Write `warp_to_level` in `ram.rs` (first attempt; Step 5 iterates on it):
-
-```rust
-/// Load `overworld`, force-enter `translevel`, and return a save state on the level's first
-/// controllable frame. Errors if the level never reaches in-level mode.
-pub fn warp_to_level(emu: &mut Emulator, overworld: &[u8], translevel: u8) -> Result<Vec<u8>, String> {
-    emu.load_state(overworld)?;
-    emu.set_buttons(0);
-    emu.run_frame();
-    emu.write_ram(TRANSLEVEL, &[translevel]);
-    // Pressing A on a level tile makes the game start loading the level; mimic that.
-    drive_to_level(emu, 600)?;
-    for _ in 0..60 {
-        emu.run_frame(); // fade in, Mario lands
-    }
-    if game_mode(emu) != 0x14 {
-        return Err(format!("translevel {translevel:#04x}: ended in mode {:#04x}", game_mode(emu)));
-    }
-    emu.save_state()
-}
-```
-
-Create `examples/warp_probe.rs`:
-
-```rust
-//! Spike: checks RAM addresses and whether writing the translevel number from the overworld
-//! loads the requested level. Prints a table; no pass/fail, the author reads it.
-use burn_mario_rl::emulator::Emulator;
-use burn_mario_rl::env::overworld_state;
-use burn_mario_rl::ram::{self, warp_to_level};
-use std::path::PathBuf;
-
-fn main() -> Result<(), String> {
-    let core = PathBuf::from(std::env::var("CORE").unwrap_or("/usr/lib/libretro/snes9x_libretro.so".into()));
-    let rom = PathBuf::from("Super Mario World (USA).sfc");
-    let mut emu = Emulator::load(&core, &rom)?;
-    let ow = overworld_state(&mut emu)?;
-
-    // 1. Baseline: warping to the translevel we already reach by hand must match the hand-made state.
-    println!("translevel_at_overworld = {:#04x}", emu.ram()[ram::TRANSLEVEL]);
-
-    // 2. Sweep every translevel number.
-    for tl in 0u8..=0x24 {
-        match warp_to_level(&mut emu, &ow, tl) {
-            Ok(_) => {
-                let r = emu.ram();
-                println!(
-                    "tl {tl:#04x}: ok  x={:5} y={:5} timer={:3} vertical={} sprites_active={}",
-                    ram::u16_at(r, ram::PLAYER_X),
-                    ram::u16_at(r, ram::PLAYER_Y),
-                    ram::timer(r),
-                    ram::is_vertical(r),
-                    (0..ram::SPRITE_SLOTS).filter(|&i| r[ram::SPRITE_STATUS + i] != 0).count(),
-                );
-            }
-            Err(e) => println!("tl {tl:#04x}: FAIL {e}"),
-        }
-    }
-
-    // 3. Timer tick length: frames per one timer decrement in level 1.
-    let l1 = warp_to_level(&mut emu, &ow, emu_level1_translevel(&mut emu, &ow))?;
-    emu.load_state(&l1)?;
-    let (mut last, mut since, mut ticks) = (ram::timer(emu.ram()), 0u32, Vec::new());
-    for _ in 0..600 {
-        emu.run_frame();
-        since += 1;
-        let t = ram::timer(emu.ram());
-        if t != last {
-            ticks.push(since);
-            since = 0;
-            last = t;
-        }
-    }
-    println!("frames between timer ticks: {ticks:?}");
-    Ok(())
-}
-
-/// The translevel the overworld cursor currently points at.
-fn emu_level1_translevel(emu: &mut Emulator, _ow: &[u8]) -> u8 {
-    emu.ram()[ram::TRANSLEVEL]
-}
-```
-
-- [ ] **Step 4: Run the probe**
-
-Run: `cargo run --release --example warp_probe 2>&1 | tail -60`
-Expected: a table. Success means: for at least 15 translevel numbers the row says `ok` with `vertical=false`, `timer` a plausible 100-500 value, and the frames-between-ticks list is constant (all equal, note the value).
-
-If every row says FAIL: the game-mode trigger is wrong. In `warp_to_level`, instead of `drive_to_level` after writing `TRANSLEVEL`, write the game mode byte (`emu.write_ram(ram::GAME_MODE, &[m])`) for each `m` in `[0x0F, 0x10, 0x11, 0x12]` (reload the overworld state between attempts) and keep the one that reaches mode `0x14`. Also try also setting `$0DD6`-adjacent overworld cursor bytes only if needed. Record which trigger worked in a comment on `warp_to_level`.
-
-If rows load but the wrong level (check by comparing: warping to level 1's translevel must reproduce `level1.state`'s first-frame `PLAYER_X`, `PLAYER_Y` and `timer`): the translevel write is taking effect after the loader reads it; write it in a frame earlier and re-test.
-
-- [ ] **Step 5: Confirm sprite and Mario addresses**
-
-Edit `examples/warp_probe.rs` to also run 300 frames of RIGHT held in a level that has sprites, printing sprite slots with `status != 0` as `(slot, type, x, y)` each 60 frames. Confirm sprite X values change as the screen scrolls, and that `PLAYER_SPEED_X` is positive and growing while running right, `PLAYER_BLOCKED & 4` is set while standing. If any address is wrong, correct the constant in `ram.rs` (comment how it was verified).
-
-- [ ] **Step 6: Record measured constants**
-
-Add to `src/ram.rs`, using the measured value from Step 4:
-
-```rust
-/// Emulator frames per one tick of the in-game timer (measured by `examples/warp_probe.rs`).
-pub const TIMER_TICK_FRAMES: u32 = 40;
-```
-
-Replace `40` with the measured constant. Add `levels/` to `.gitignore`.
-
-- [ ] **Step 7: Commit**
-
-```bash
-cargo check --examples
-git add src examples .gitignore
-git commit -m "Add RAM address module, write_ram and level warp probe"
-```
+Completed; see "Task 1 outcome" above. Produced `src/ram.rs`, `Emulator::write_ram`, `env::overworld_state`, `ram::warp_to_position` and `examples/warp_probe.rs`. The original translevel-write approach in this task was disproved by experiment and removed.
 
 ---
 
@@ -290,9 +74,9 @@ git commit -m "Add RAM address module, write_ram and level warp probe"
 - Modify: `src/lib.rs` (`pub mod levels;`)
 
 **Interfaces:**
-- Consumes: `ram::warp_to_level`, `env::overworld_state`, `ram::is_vertical`
+- Consumes: `ram::warp_to_position`, `env::overworld_state`, `ram::is_vertical`, `ram::MAP_X`, `ram::MAP_Y`
 - Produces:
-  - `pub struct Level { pub id: usize, pub translevel: u8, pub held_out: bool, pub state: Vec<u8> }`
+  - `pub struct Level { pub id: usize, pub translevel: u8, pub map_x: u16, pub map_y: u16, pub held_out: bool, pub state: Vec<u8> }`
   - `pub struct LevelSet { pub levels: Vec<Level> }`
   - `LevelSet::load(dir: &Path) -> Result<LevelSet, String>`
   - `LevelSet::save(&self, dir: &Path) -> Result<(), String>`
@@ -323,14 +107,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("levels_test_{}", std::process::id()));
         let set = LevelSet {
             levels: vec![
-                Level { id: 0, translevel: 5, held_out: false, state: vec![1, 2, 3] },
-                Level { id: 1, translevel: 9, held_out: true, state: vec![4, 5] },
+                Level { id: 0, translevel: 5, map_x: 152, map_y: 136, held_out: false, state: vec![1, 2, 3] },
+                Level { id: 1, translevel: 9, map_x: 264, map_y: 24, held_out: true, state: vec![4, 5] },
             ],
         };
         set.save(&dir).unwrap();
         let back = LevelSet::load(&dir).unwrap();
         assert_eq!(back.levels.len(), 2);
         assert_eq!(back.levels[1].translevel, 9);
+        assert_eq!((back.levels[1].map_x, back.levels[1].map_y), (264, 24));
         assert!(back.levels[1].held_out);
         assert_eq!(back.levels[1].state, vec![4, 5]);
         assert_eq!(back.train_ids(), vec![0]);
@@ -355,7 +140,11 @@ use std::path::Path;
 
 pub struct Level {
     pub id: usize,
+    /// `$13BF` after loading; informational (names the level in logs).
     pub translevel: u8,
+    /// Overworld cursor position the level was entered from.
+    pub map_x: u16,
+    pub map_y: u16,
     pub held_out: bool,
     pub state: Vec<u8>,
 }
@@ -389,7 +178,7 @@ impl LevelSet {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let mut manifest = String::new();
         for l in &self.levels {
-            manifest.push_str(&format!("{} {} {}\n", l.id, l.translevel, if l.held_out { "held_out" } else { "train" }));
+            manifest.push_str(&format!("{} {} {} {} {}\n", l.id, l.translevel, l.map_x, l.map_y, if l.held_out { "held_out" } else { "train" }));
             std::fs::write(dir.join(format!("{}.state", l.id)), &l.state).map_err(|e| e.to_string())?;
         }
         std::fs::write(dir.join("manifest.txt"), manifest).map_err(|e| e.to_string())
@@ -400,13 +189,15 @@ impl LevelSet {
         let mut levels = Vec::new();
         for line in manifest.lines().filter(|l| !l.trim().is_empty()) {
             let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() != 3 {
+            if f.len() != 5 {
                 return Err(format!("bad manifest line: {line}"));
             }
             let id: usize = f[0].parse().map_err(|_| format!("bad id in {line}"))?;
             let translevel: u8 = f[1].parse().map_err(|_| format!("bad translevel in {line}"))?;
+            let map_x: u16 = f[2].parse().map_err(|_| format!("bad map_x in {line}"))?;
+            let map_y: u16 = f[3].parse().map_err(|_| format!("bad map_y in {line}"))?;
             let state = std::fs::read(dir.join(format!("{id}.state"))).map_err(|e| e.to_string())?;
-            levels.push(Level { id, translevel, held_out: f[2] == "held_out", state });
+            levels.push(Level { id, translevel, map_x, map_y, held_out: f[4] == "held_out", state });
         }
         Ok(Self { levels })
     }
@@ -421,12 +212,12 @@ Expected: 2 passed.
 - [ ] **Step 5: Write `examples/make_levels.rs`**
 
 ```rust
-//! Warps into every translevel, keeps the horizontal ones where a biased-random policy makes
+//! Scans the overworld map, enters every level tile, keeps the horizontal ones where a biased-random policy makes
 //! progress, and writes them to LEVELS_DIR (default `levels`). Env: CORE, LEVELS_DIR.
 use burn_mario_rl::emulator::Emulator;
 use burn_mario_rl::env::{MarioEnv, Outcome, overworld_state};
 use burn_mario_rl::levels::{Level, LevelSet, assign_split};
-use burn_mario_rl::ram::{self, warp_to_level};
+use burn_mario_rl::ram::{self, warp_to_position};
 use std::path::PathBuf;
 
 fn main() -> Result<(), String> {
@@ -436,44 +227,55 @@ fn main() -> Result<(), String> {
     let mut emu = Emulator::load(&core, &rom)?;
     let ow = overworld_state(&mut emu)?;
 
-    let mut kept: Vec<(u8, Vec<u8>)> = Vec::new();
-    for tl in 0u8..=0x24 {
-        let state = match warp_to_level(&mut emu, &ow, tl) {
-            Ok(s) => s,
-            Err(e) => {
-                println!("tl {tl:#04x}: skip ({e})");
+    // (translevel, x, y, state); the same level can be entered from one tile only, but guard anyway.
+    let mut kept: Vec<(u8, u16, u16, Vec<u8>)> = Vec::new();
+    let mut seen_tl = std::collections::HashSet::new();
+    for ty in 0..32u16 {
+        for tx in 0..32u16 {
+            let (x, y) = (tx * 16 + 8, ty * 16 + 8);
+            let state = match warp_to_position(&mut emu, &ow, x, y) {
+                Ok(s) => s,
+                Err(_) => continue, // not a level tile
+            };
+            let tl = emu.ram()[ram::TRANSLEVEL];
+            if !seen_tl.insert(tl) {
                 continue;
             }
-        };
-        if ram::is_vertical(emu.ram()) {
-            println!("tl {tl:#04x}: skip (vertical)");
-            continue;
-        }
-        // Progress probe: biased-random policy, best of 3 tries.
-        let mut env = MarioEnv::new(&core, &rom, state.clone())?;
-        let mut rng = 99u64 + tl as u64;
-        let mut best = 0u16;
-        for _ in 0..3 {
-            env.reset()?;
-            for _ in 0..600 {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let a = if rng >> 60 < 9 { 4 } else { (rng >> 33) as usize % burn_mario_rl::env::ACTIONS.len() };
-                if env.step(a).outcome != Outcome::Running {
-                    break;
-                }
+            if ram::is_vertical(emu.ram()) {
+                println!("({x:3},{y:3}) tl {tl:#04x}: skip (vertical)");
+                continue;
             }
-            best = best.max(env.max_x());
+            // Progress probe: biased-random policy, best of 3 tries.
+            let mut env = MarioEnv::new(&core, &rom, state.clone())?;
+            let mut rng = 99u64 + tl as u64;
+            let mut best = 0u16;
+            for _ in 0..3 {
+                env.reset()?;
+                for _ in 0..600 {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let a = if rng >> 60 < 9 { 4 } else { (rng >> 33) as usize % burn_mario_rl::env::ACTIONS.len() };
+                    if env.step(a).outcome != Outcome::Running {
+                        break;
+                    }
+                }
+                best = best.max(env.max_x());
+            }
+            if best < 300 {
+                println!("({x:3},{y:3}) tl {tl:#04x}: skip (random policy reached only x={best})");
+                continue;
+            }
+            println!("({x:3},{y:3}) tl {tl:#04x}: keep (random policy reached x={best})");
+            kept.push((tl, x, y, state));
         }
-        if best < 300 {
-            println!("tl {tl:#04x}: skip (random policy reached only x={best})");
-            continue;
-        }
-        println!("tl {tl:#04x}: keep (random policy reached x={best})");
-        kept.push((tl, state));
     }
 
     let split = assign_split(kept.len());
-    let levels = kept.into_iter().zip(split).enumerate().map(|(id, ((translevel, state), held_out))| Level { id, translevel, held_out, state }).collect();
+    let levels = kept
+        .into_iter()
+        .zip(split)
+        .enumerate()
+        .map(|(id, ((translevel, map_x, map_y, state), held_out))| Level { id, translevel, map_x, map_y, held_out, state })
+        .collect();
     let set = LevelSet { levels };
     set.save(&out)?;
     println!("wrote {} levels ({} held out) to {}", set.levels.len(), set.held_out_ids().len(), out.display());
@@ -484,7 +286,7 @@ fn main() -> Result<(), String> {
 - [ ] **Step 6: Run it and review the result**
 
 Run: `cargo run --release --example make_levels 2>&1 | tail -50`
-Expected: a keep/skip line per translevel and a final `wrote N levels (M held out)`. Report N to the user. If N < 15 that is acceptable (see Global Constraints) but state it plainly. If N < 5, stop and ask the user, since there is no held-out split.
+Expected: about 40 level tiles found (35 horizontal), a keep/skip line each, and a final `wrote N levels (M held out)`. The scan takes a couple of minutes. Report N to the user. If N < 15 that is acceptable (see Global Constraints) but state it plainly. If N < 5, stop and ask the user, since there is no held-out split.
 
 - [ ] **Step 7: Commit**
 
@@ -614,7 +416,7 @@ Constructors:
 
 ```rust
     pub fn new(core: &Path, rom: &Path, start_state: Vec<u8>) -> Result<Self, String> {
-        let set = LevelSet { levels: vec![Level { id: 0, translevel: 0, held_out: false, state: start_state }] };
+        let set = LevelSet { levels: vec![Level { id: 0, translevel: 0, map_x: 0, map_y: 0, held_out: false, state: start_state }] };
         Self::with_levels(core, rom, Arc::new(set), 1.0)
     }
 

@@ -243,6 +243,16 @@ impl Emulator {
         }
     }
 
+    /// Overwrite work RAM at `offset` (`$7E0000 + offset`).
+    pub fn write_ram(&mut self, offset: usize, data: &[u8]) {
+        unsafe {
+            let ptr = (self.get_memory_data)(MEMORY_SYSTEM_RAM) as *mut u8;
+            let len = (self.get_memory_size)(MEMORY_SYSTEM_RAM);
+            assert!(!ptr.is_null() && offset + data.len() <= len, "write_ram out of range");
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
+        }
+    }
+
     pub fn save_state(&self) -> Result<Vec<u8>, String> {
         unsafe {
             let mut buf = vec![0u8; (self.serialize_size)()];
