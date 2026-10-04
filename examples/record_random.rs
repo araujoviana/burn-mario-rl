@@ -15,8 +15,7 @@ fn main() -> Result<(), String> {
         let outcome = loop {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             let a = if rng >> 60 < 9 { 4 } else { (rng >> 33) as usize % ACTIONS.len() };
-            let r = env.step(a);
-            env.emulator().with_frame(|rgb, _, _| frames.push(rgb.to_vec()));
+            let r = env.step_with(a, |emu| emu.with_frame(|rgb, _, _| frames.push(rgb.to_vec())));
             if r.outcome != Outcome::Running { break r.outcome; }
         };
         println!("ep {ep}: {outcome:?}, {} frames", frames.len());
@@ -34,7 +33,7 @@ fn main() -> Result<(), String> {
                 std::fs::write("/tmp/after_clear.ppm", out).unwrap();
             });
             let mut ff = Command::new("ffmpeg")
-                .args(["-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "256x224", "-r", "15", "-i", "-"])
+                .args(["-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "256x224", "-r", "60", "-i", "-"])
                 .args(["-vf", "scale=768:672:flags=neighbor", "-c:v", "libx264", "-pix_fmt", "yuv420p", &out])
                 .stdin(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
             let mut stdin = ff.stdin.take().unwrap();

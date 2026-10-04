@@ -160,9 +160,15 @@ impl MarioEnv {
     }
 
     pub fn step(&mut self, action: usize) -> StepResult {
+        self.step_with(action, |_| {})
+    }
+
+    /// Like `step`, but calls `on_frame` after every emulator frame (for recording video).
+    pub fn step_with(&mut self, action: usize, mut on_frame: impl FnMut(&Emulator)) -> StepResult {
         self.emu.set_buttons(ACTIONS[action]);
         for _ in 0..FRAME_SKIP {
             self.emu.run_frame();
+            on_frame(&self.emu);
         }
         let plane = OBS_W * OBS_H;
         self.obs.copy_within(plane.., 0);
