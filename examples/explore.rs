@@ -12,7 +12,7 @@ fn mask(name: &str) -> u16 {
 }
 
 fn main() -> Result<(), String> {
-    let mut emu = Emulator::load(&PathBuf::from("/usr/lib/libretro/snes9x_libretro.so"), &PathBuf::from("Super Mario World (USA).sfc"))?;
+    let mut emu = Emulator::load(&PathBuf::from(std::env::var("CORE").unwrap_or("/usr/lib/libretro/snes9x_libretro.so".into())), &PathBuf::from("Super Mario World (USA).sfc"))?;
     let report = |emu: &Emulator, tag: &str| {
         let r = emu.ram();
         println!("{tag}: mode={:#04x} level={:#04x} x={} lives={}", r[0x100], r[0x13BF], u16::from_le_bytes([r[0x94], r[0x95]]), r[0xDBE]);

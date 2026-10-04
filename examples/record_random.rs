@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 fn main() -> Result<(), String> {
     let out = std::env::args().nth(1).unwrap_or("/tmp/random_clear.mp4".into());
     let state = std::fs::read("level1.state").map_err(|e| e.to_string())?;
-    let mut env = MarioEnv::new(&PathBuf::from("/usr/lib/libretro/snes9x_libretro.so"), &PathBuf::from("Super Mario World (USA).sfc"), state)?;
+    let mut env = MarioEnv::new(&PathBuf::from(std::env::var("CORE").unwrap_or("/usr/lib/libretro/snes9x_libretro.so".into())), &PathBuf::from("Super Mario World (USA).sfc"), state)?;
     let mut rng = 12345u64;
     for ep in 0..40 {
         env.reset()?;

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() -> Result<(), String> {
-    let core = PathBuf::from("/usr/lib/libretro/snes9x_libretro.so");
+    let core = PathBuf::from(std::env::var("CORE").unwrap_or("/usr/lib/libretro/snes9x_libretro.so".into()));
     let rom = PathBuf::from("Super Mario World (USA).sfc");
     let state = level_start_state(&mut Emulator::load(&core, &rom)?)?;
     std::fs::write("level1.state", &state).map_err(|e| e.to_string())?;
