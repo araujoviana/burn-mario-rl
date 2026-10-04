@@ -4,17 +4,21 @@ use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 use burn_mario_rl::backend::{Inner, Train as B};
 use burn_mario_rl::env::{OBS_H, OBS_W, STACK};
-use burn_mario_rl::ppo::ActorCritic;
+use burn_mario_rl::entities::ENT_LEN;
+use burn_mario_rl::ppo::{ActorCritic, NetConfig};
 use std::time::Instant;
 
 fn main() {
     let device = Default::default();
     println!("backend {}", burn_mario_rl::backend::name());
-    let model = ActorCritic::<B>::new(&device);
+    let cfg = NetConfig::from_env();
+    println!("net {}", cfg.to_line());
+    let model = ActorCritic::<B>::new(&cfg, &device);
     for (batch, backward) in [(32usize, false), (128, false), (1024, true), (1024, true)] {
         let obs = Tensor::<B, 4>::random([batch, STACK, OBS_H, OBS_W], burn::tensor::Distribution::Uniform(0.0, 255.0), &device);
+        let ent = Tensor::<B, 2>::zeros([batch, ENT_LEN], &device);
         let run = || {
-            let (logits, value) = model.forward(obs.clone());
+            let (logits, value) = model.forward(obs.clone(), ent.clone());
             if backward {
                 let _grads = (logits.mean() + value.mean()).backward();
             } else {
