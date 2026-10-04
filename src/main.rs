@@ -16,6 +16,46 @@ fn write_ppm(path: &str, rgb: &[u8], w: u32, h: u32) {
     std::fs::write(path, out).expect("write ppm");
 }
 
+/// Scripted inputs for the demo video: get through the title screen, then run right.
+fn demo_input(f: u32) -> u16 {
+    let tap = |period: u32, hold: u32| f % period < hold;
+    match f {
+        0..600 => 0,
+        600..1500 if tap(90, 5) => button::START,
+        600..1500 => 0,
+        1500..2100 if tap(90, 5) => button::A,
+        1500..2100 => 0,
+        _ => {
+            let jump = if tap(50, 25) { button::A } else { 0 };
+            button::RIGHT | button::Y | jump
+        }
+    }
+}
+
+fn demo(emu: &mut Emulator, out: &str, frames: u32) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut ff = Command::new("ffmpeg")
+        .args(["-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "256x224", "-r", "60", "-i", "-"])
+        .args(["-vf", "scale=768:672:flags=neighbor", "-c:v", "libx264", "-pix_fmt", "yuv420p", out])
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut stdin = ff.stdin.take().ok_or("no ffmpeg stdin")?;
+    for f in 0..frames {
+        emu.set_buttons(demo_input(f));
+        emu.run_frame();
+        let (rgb, w, h) = emu.frame();
+        if (w, h) == (256, 224) {
+            stdin.write_all(&rgb).map_err(|e| e.to_string())?;
+        }
+    }
+    drop(stdin);
+    ff.wait().map_err(|e| e.to_string())?;
+    println!("wrote {out} ({frames} frames)");
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let core = PathBuf::from(args.next().unwrap_or("/usr/lib/libretro/snes9x_libretro.so".into()));
@@ -23,6 +63,10 @@ fn main() -> Result<(), String> {
 
     let mut emu = Emulator::load(&core, &rom)?;
     println!("core loaded, native fps {:.2}, work RAM {} bytes", emu.fps, emu.ram().len());
+
+    if let Ok(out) = std::env::var("DEMO") {
+        return demo(&mut emu, &out, 5400);
+    }
 
     // Boot and dump a frame every 300 frames to see what the game is showing.
     for i in 1..=2400u32 {
