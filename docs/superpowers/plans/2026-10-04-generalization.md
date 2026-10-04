@@ -782,14 +782,28 @@ mod tests {
         let mut s = LevelSampler::new(vec![0, 1], PlrConfig { enabled: true, temperature: 0.3, rho: 0.9, ema: 0.5 });
         s.update(0, 1.0);
         s.update(1, 1.0);
-        let mut rng = 7u64;
         for _ in 0..50 {
             s.note_sampled(0);
         }
         let w = s.weights();
         let p = |id: usize| w.iter().find(|(i, _)| *i == id).unwrap().1;
         assert!(p(1) > p(0), "level 1 is staler");
-        let _ = &mut rng;
+    }
+
+    #[test]
+    fn tied_scores_get_equal_weight() {
+        // Before any update every score is 0; list order must not decide the weights.
+        let s = LevelSampler::new(vec![0, 1, 2, 3], cfg(true));
+        let w = s.weights();
+        for (_, p) in &w {
+            assert!((p - 0.25).abs() < 1e-6, "got {w:?}");
+        }
+        let mut s = LevelSampler::new(vec![0, 1, 2], cfg(true));
+        s.update(2, 3.0); // one clear leader, two tied behind it
+        let w = s.weights();
+        let p = |id: usize| w.iter().find(|(i, _)| *i == id).unwrap().1;
+        assert!(p(2) > p(0));
+        assert!((p(0) - p(1)).abs() < 1e-6);
     }
 
     #[test]
@@ -905,12 +919,23 @@ impl LevelSampler {
         if !self.cfg.enabled {
             return self.ids.iter().map(|&id| (id, 1.0 / n as f32)).collect();
         }
-        // Rank 1 = highest score; weight (1 / rank)^(1 / temperature).
+        // Rank 1 = highest score; weight (1 / rank)^(1 / temperature). Tied scores share the
+        // average weight of the ranks they span, so list order never breaks a tie.
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| self.scores[b].total_cmp(&self.scores[a]));
+        let rank_weight = |rank: usize| (1.0 / (rank as f32 + 1.0)).powf(1.0 / self.cfg.temperature);
         let mut p_score = vec![0.0f32; n];
-        for (rank, &i) in order.iter().enumerate() {
-            p_score[i] = (1.0 / (rank as f32 + 1.0)).powf(1.0 / self.cfg.temperature);
+        let mut start = 0;
+        while start < n {
+            let mut end = start + 1;
+            while end < n && self.scores[order[end]] == self.scores[order[start]] {
+                end += 1;
+            }
+            let shared = (start..end).map(rank_weight).sum::<f32>() / (end - start) as f32;
+            for &i in &order[start..end] {
+                p_score[i] = shared;
+            }
+            start = end;
         }
         let total: f32 = p_score.iter().sum();
         p_score.iter_mut().for_each(|p| *p /= total);
@@ -951,7 +976,7 @@ pub fn level_scores(adv: &[f32], level_ids: &[usize], num_levels: usize) -> Vec<
 - [ ] **Step 5: Run tests**
 
 Run: `cargo test --lib plr`
-Expected: 6 passed. If `staleness_lifts...` fails, check that `note_sampled` increments `clock` before storing (stale weight for level 0 must drop).
+Expected: 7 passed. If `staleness_lifts...` fails, check that `note_sampled` increments `clock` before storing (stale weight for level 0 must drop).
 
 - [ ] **Step 6: Commit**
 
