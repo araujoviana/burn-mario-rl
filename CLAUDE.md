@@ -8,7 +8,7 @@ Reinforcement learning agent that beats the first level of Super Mario World (SN
 2. **Deliverable:** a clean MP4 of a winning run, recorded at native resolution, upscaled for posting.
 3. **Speed of learning:** the user wants wall-clock training to be short. Pick the fastest GPU Colab offers and favor sample-efficient choices over elegant ones.
 
-Out of scope until Milestone 1 is done: other levels, generalization, multi-game support.
+**Generalization is now in scope** (spec `docs/superpowers/specs/2026-10-04-generalization-design.md`, plan `docs/superpowers/plans/2026-10-04-generalization.md`): the agent trains on a pool of levels with held-out levels to measure transfer. Still out of scope: multi-game support.
 
 ## Stack and fallback
 
@@ -38,6 +38,10 @@ Rust has no mature SNES emulator crate, so the emulator integration is the first
 - Start from a **save state at level start**; `reset` loads it. This also removes the need for lives to matter, since a death returns to the level start anyway.
 - **Status:** `src/env.rs` implements this and is verified. `level_start_state` plays the menus from power-on by watching game mode (`$7E0100`), and the state is cached in `level1.state` (gitignored; regenerate with `cargo run --release --example env_check`). Reward weights and caps are constants at the top of `env.rs`.
 - **Verified clear detection:** `$1493 != 0` (or leaving level mode without dying) fires at the goal gate, and the game then shows COURSE CLEAR. Death is player state `$71 == 9`.
+- **Level set (generalization):** `levels/` (gitignored, built by `cargo run --release --example make_levels`) holds 21 start states, 17 train and 4 held out (ids 4, 9, 14, 19). Levels are reached by teleporting the overworld map cursor (`$1F17`/`$1F19`) and pressing A; writing `$13BF`/level numbers does nothing. `make_levels` scans the map, drops duplicate placeholder levels (first-frame hash), vertical levels and levels a random policy cannot progress 400 px in. Known odd levels: tl 0x3b (lava cave, near-impossible), tl 0x3f/0x45 (door-ended castle rooms, the door leads to another area), tl 0x54 underwater and tl 0x39 dark (random policy stalls). Original level 1 (tl 0x2a) is id 7.
+- **Training features (all behind flags, see `src/bin/train.rs` header):** PLR level sampler (`src/plr.rs`, score = mean |GAE| per level), IMPALA-CNN trunk (`TRUNK`, `WIDTH`), entity vector from RAM fused with the CNN (`ENTITIES`, `src/entities.rs`), DrAC random-shift augmentation (`AUG_PAD`, `AUG_COEF`), speed-scaled clear bonus (`SPEED_K`, `src/reward.rs`; episode cap derived from the in-game timer, 1 timer tick = 41 frames), held-out evaluation every `EVAL_EVERY` iterations. Checkpoints save `net.cfg` so `eval` rebuilds the right architecture; `eval` takes `LEVEL=<id>`. Old single-level checkpoints are incompatible.
+- **Clear detection:** goal timer `$1493 != 0` only. Doors and pipes leave level mode but are not wins.
+- **Gotcha:** a process can hold one live emulator per core copy; dropping two `VecEnv`s corrupts the heap at exit, so `train` ends with `process::exit(0)` after saving.
 - **Difficulty:** a biased-random policy (mostly run+jump right) clears the level about 1 episode in 4, in about 650 agent steps. Expect fast learning; if training stalls, suspect a bug before the algorithm.
 - **Buttons:** B jumps, Y runs (SNES layout). A is spin jump and is not in the action set.
 - **Frame skip** 4 and **frame stack** 4, grayscale, downscaled (about 84x84).
