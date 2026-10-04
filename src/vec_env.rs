@@ -12,6 +12,8 @@ pub struct EpisodeInfo {
     pub steps: u32,
     pub outcome: Outcome,
     pub max_x: u16,
+    /// Which start state the episode began from (0 = real level start).
+    pub start: usize,
 }
 
 struct Reply {
@@ -37,8 +39,8 @@ pub struct StepBatch {
     pub finished: Vec<EpisodeInfo>,
 }
 
-fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, state: Vec<u8>, commands: Receiver<usize>, replies: Sender<Reply>) {
-    let mut env = match MarioEnv::new(&core, &rom, state) {
+fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, starts: Vec<Vec<u8>>, p_start: f32, commands: Receiver<usize>, replies: Sender<Reply>) {
+    let mut env = match MarioEnv::with_starts(&core, &rom, starts, p_start, id as u64 + 1) {
         Ok(env) => env,
         Err(e) => {
             eprintln!("worker {id}: {e}");
@@ -53,7 +55,7 @@ fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, state: V
         ret += reward;
         steps += 1;
         let done = outcome != Outcome::Running;
-        let info = done.then(|| EpisodeInfo { ret, steps, outcome, max_x: env.max_x() });
+        let info = done.then(|| EpisodeInfo { ret, steps, outcome, max_x: env.max_x(), start: env.start_index() });
         if done {
             let _ = env.reset();
             ret = 0.0;
@@ -66,7 +68,7 @@ fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, state: V
 }
 
 impl VecEnv {
-    pub fn new(n: usize, core: &Path, rom: &Path, state: &[u8]) -> Result<Self, String> {
+    pub fn new(n: usize, core: &Path, rom: &Path, starts: &[Vec<u8>], p_start: f32) -> Result<Self, String> {
         let (reply_tx, replies) = channel();
         let (mut commands, mut workers) = (Vec::new(), Vec::new());
         for id in 0..n {
@@ -74,8 +76,8 @@ impl VecEnv {
             std::fs::copy(core, &copy).map_err(|e| format!("copy core: {e}"))?;
             let (tx, rx) = channel();
             commands.push(tx);
-            let (rom, state, reply_tx) = (rom.to_path_buf(), state.to_vec(), reply_tx.clone());
-            workers.push(std::thread::spawn(move || worker(id, copy, rom, state, rx, reply_tx)));
+            let (rom, starts, reply_tx) = (rom.to_path_buf(), starts.to_vec(), reply_tx.clone());
+            workers.push(std::thread::spawn(move || worker(id, copy, rom, starts, p_start, rx, reply_tx)));
         }
         drop(reply_tx);
         let mut obs = vec![0u8; n * OBS_LEN];

@@ -119,7 +119,12 @@ fn grayscale_downscale(emu: &Emulator, out: &mut [u8]) {
 
 pub struct MarioEnv {
     emu: Emulator,
-    start_state: Vec<u8>,
+    /// Save states an episode can begin from; index 0 is the real level start.
+    starts: Vec<Vec<u8>>,
+    /// Chance of beginning at index 0 when there are other starts to pick from.
+    p_start: f32,
+    rng: u64,
+    current_start: usize,
     /// `STACK` grayscale planes, oldest first.
     obs: Vec<u8>,
     prev_x: u16,
@@ -130,9 +135,42 @@ pub struct MarioEnv {
 
 impl MarioEnv {
     pub fn new(core: &Path, rom: &Path, start_state: Vec<u8>) -> Result<Self, String> {
-        let mut env = Self { emu: Emulator::load(core, rom)?, start_state, obs: vec![0; OBS_LEN], prev_x: 0, max_x: 0, steps: 0, stall: 0 };
+        Self::with_starts(core, rom, vec![start_state], 1.0, 0)
+    }
+
+    /// Curriculum env: `starts[0]` is the level start, the rest are mid-level states.
+    pub fn with_starts(core: &Path, rom: &Path, starts: Vec<Vec<u8>>, p_start: f32, seed: u64) -> Result<Self, String> {
+        let mut env = Self {
+            emu: Emulator::load(core, rom)?,
+            starts,
+            p_start,
+            rng: seed.wrapping_mul(0x9E3779B97F4A7C15) | 1,
+            current_start: 0,
+            obs: vec![0; OBS_LEN],
+            prev_x: 0,
+            max_x: 0,
+            steps: 0,
+            stall: 0,
+        };
         env.reset()?;
         Ok(env)
+    }
+
+    fn next_random(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+
+    /// Index of the state the current episode began from (0 = real level start).
+    pub fn start_index(&self) -> usize {
+        self.current_start
+    }
+
+    /// Mario's X position after the latest step.
+    pub fn x(&self) -> u16 {
+        self.prev_x
     }
 
     pub fn emulator(&self) -> &Emulator {
@@ -140,7 +178,12 @@ impl MarioEnv {
     }
 
     pub fn reset(&mut self) -> Result<&[u8], String> {
-        self.emu.load_state(&self.start_state)?;
+        self.current_start = if self.starts.len() == 1 || (self.next_random() >> 40) as f32 / (1u64 << 24) as f32 <= self.p_start {
+            0
+        } else {
+            1 + (self.next_random() % (self.starts.len() as u64 - 1)) as usize
+        };
+        self.emu.load_state(&self.starts[self.current_start])?;
         self.emu.set_buttons(0);
         self.emu.run_frame(); // refresh the framebuffer after the state load
         self.prev_x = x_pos(&self.emu);

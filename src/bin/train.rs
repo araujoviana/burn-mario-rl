@@ -31,6 +31,16 @@ fn main() -> Result<(), String> {
     let core = PathBuf::from(cfg("CORE", "/usr/lib/libretro/snes9x_libretro.so".to_string()));
     let rom = PathBuf::from(cfg("ROM", "Super Mario World (USA).sfc".to_string()));
     let state = std::fs::read(cfg("STATE", "level1.state".to_string())).map_err(|e| format!("read state (run env_check first): {e}"))?;
+    let mut states = vec![state];
+    if let Ok(dir) = std::env::var("CURRICULUM") {
+        let mut files: Vec<_> = std::fs::read_dir(&dir).map_err(|e| format!("curriculum dir {dir}: {e}"))?.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "state")).collect();
+        files.sort();
+        for f in &files {
+            states.push(std::fs::read(f).map_err(|e| e.to_string())?);
+        }
+        println!("curriculum: {} extra start states from {dir}", files.len());
+    }
+    let p_start: f32 = cfg("START_PROB", 0.4);
     let mut rng: u64 = cfg("SEED", 0x2545F4914F6CDD1D);
     let hyper = Hyper { lr: cfg("LR", 2.5e-4), clip: 0.2, value_coef: 0.5, entropy_coef: cfg("ENTROPY", 0.01), epochs: cfg("EPOCHS", 4), minibatches: cfg("MINIBATCHES", 4) };
     let (gamma, lambda): (f32, f32) = (cfg("GAMMA", 0.99), cfg("LAMBDA", 0.95));
@@ -42,9 +52,13 @@ fn main() -> Result<(), String> {
     println!("backend {}", burn_mario_rl::backend::name());
     let mut model = ActorCritic::<B>::new(&device);
     let mut optim = AdamConfig::new().with_epsilon(1e-5).with_grad_clipping(Some(GradientClippingConfig::Norm(0.5))).init();
+    if let Ok(path) = std::env::var("INIT") {
+        model = model.load_file(path.clone(), &CompactRecorder::new(), &device).map_err(|e| format!("INIT {path}: {e}"))?;
+        println!("warm start from {path}");
+    }
     std::fs::create_dir_all(&ckpt_dir).map_err(|e| e.to_string())?;
 
-    let mut envs = VecEnv::new(n, &core, &rom, &state)?;
+    let mut envs = VecEnv::new(n, &core, &rom, &states, p_start)?;
     println!("{n} envs up, rollout {rollout}, {} steps per iteration, {} updates per iteration, lr {}, gamma {gamma}, lambda {lambda}", n * rollout, hyper.epochs * hyper.minibatches, hyper.lr);
 
     let batch_size = n * rollout;
@@ -56,6 +70,8 @@ fn main() -> Result<(), String> {
     let mut dones = vec![false; batch_size];
 
     let mut recent: VecDeque<EpisodeInfo> = VecDeque::new();
+    // Only episodes from the real level start, the number that matters for the final video.
+    let mut recent_start: VecDeque<EpisodeInfo> = VecDeque::new();
     let (mut steps_done, mut iter, mut best_mean, start) = (0u64, 0u32, f32::MIN, Instant::now());
 
     while steps_done < total_steps {
@@ -83,6 +99,12 @@ fn main() -> Result<(), String> {
                 recent.push_back(info);
                 if recent.len() > 100 {
                     recent.pop_front();
+                }
+                if info.start == 0 {
+                    recent_start.push_back(info);
+                    if recent_start.len() > 100 {
+                        recent_start.pop_front();
+                    }
                 }
             }
         }
@@ -126,17 +148,22 @@ fn main() -> Result<(), String> {
         let mean_ret = recent.iter().map(|e| e.ret).sum::<f32>() / finished;
         let clear_rate = recent.iter().filter(|e| e.outcome == Outcome::Cleared).count() as f32 / finished;
         let mean_x = recent.iter().map(|e| e.max_x as f32).sum::<f32>() / finished;
+        let n_start = recent_start.len().max(1) as f32;
+        let start_ret = recent_start.iter().map(|e| e.ret).sum::<f32>() / n_start;
+        let start_clear = recent_start.iter().filter(|e| e.outcome == Outcome::Cleared).count() as f32 / n_start;
         println!(
-            "iter {iter:4} steps {steps_done:8} | rollout {rollout_secs:.1}s total {:.1}s | {:5.0} sps | return {mean_ret:7.1} clear {:3.0}% max_x {mean_x:6.0} | pl {:+.3} vl {:.3} ent {:.3}",
+            "iter {iter:4} steps {steps_done:8} | rollout {rollout_secs:.1}s total {:.1}s | {:5.0} sps | all-starts return {mean_ret:6.1} clear {:3.0}% | from-start return {start_ret:6.1} clear {:3.0}% (n={}) max_x {mean_x:5.0} | pl {:+.3} vl {:.3} ent {:.3}",
             iter_start.elapsed().as_secs_f32(),
             batch_size as f32 / iter_start.elapsed().as_secs_f32(),
             clear_rate * 100.0,
+            start_clear * 100.0,
+            recent_start.len(),
             stats.policy_loss,
             stats.value_loss,
             stats.entropy,
         );
-        if recent.len() >= 20 && mean_ret > best_mean {
-            best_mean = mean_ret;
+        if recent_start.len() >= 20 && start_ret > best_mean {
+            best_mean = start_ret;
             model.clone().save_file(format!("{ckpt_dir}/best"), &CompactRecorder::new()).map_err(|e| e.to_string())?;
         }
         if iter % 10 == 0 {
