@@ -1,7 +1,9 @@
-//! Super Mario World level-1 environment: boot script, observations, actions, reward.
+//! Super Mario World environment: boot script, level selection, observations, actions, reward.
 
 use crate::emulator::{Emulator, button};
+use crate::levels::{Level, LevelSet};
 use std::path::Path;
+use std::sync::Arc;
 
 pub const OBS_W: usize = 84;
 pub const OBS_H: usize = 84;
@@ -31,10 +33,10 @@ const MODE_IN_LEVEL: u8 = 0x14;
 const PLAYER_DYING: u8 = 9;
 
 const REWARD_PER_TILE: f32 = 1.0 / 16.0;
-const REWARD_CLEAR: f32 = 100.0;
 const PENALTY_DEATH: f32 = 20.0;
 const PENALTY_STEP: f32 = 0.02;
-const MAX_STEPS: u32 = 1500;
+/// A drop in X bigger than this in one step means a door or pipe took Mario to another area.
+const AREA_CHANGE_DX: i32 = 200;
 /// Steps allowed without a new furthest X before the episode is cut.
 const MAX_STALL: u32 = 200;
 
@@ -136,12 +138,13 @@ fn grayscale_downscale(emu: &Emulator, out: &mut [u8]) {
 
 pub struct MarioEnv {
     emu: Emulator,
-    /// Save states an episode can begin from; index 0 is the real level start.
-    starts: Vec<Vec<u8>>,
-    /// Chance of beginning at index 0 when there are other starts to pick from.
-    p_start: f32,
-    rng: u64,
-    current_start: usize,
+    levels: Arc<LevelSet>,
+    /// Index into `levels.levels` of the current episode.
+    level: usize,
+    /// Weight of the speed term in the clear bonus (see `reward::clear_bonus`).
+    k_speed: f32,
+    timer_start: u32,
+    step_cap: u32,
     /// `STACK` grayscale planes, oldest first.
     obs: Vec<u8>,
     prev_x: u16,
@@ -151,38 +154,34 @@ pub struct MarioEnv {
 }
 
 impl MarioEnv {
+    /// Single-level env from one start state.
     pub fn new(core: &Path, rom: &Path, start_state: Vec<u8>) -> Result<Self, String> {
-        Self::with_starts(core, rom, vec![start_state], 1.0, 0)
+        let set = LevelSet { levels: vec![Level { id: 0, translevel: 0, map_x: 0, map_y: 0, held_out: false, state: start_state }] };
+        Self::with_levels(core, rom, Arc::new(set), 1.0)
     }
 
-    /// Curriculum env: `starts[0]` is the level start, the rest are mid-level states.
-    pub fn with_starts(core: &Path, rom: &Path, starts: Vec<Vec<u8>>, p_start: f32, seed: u64) -> Result<Self, String> {
+    /// Multi-level env; `reset_to` picks the level of each episode.
+    pub fn with_levels(core: &Path, rom: &Path, levels: Arc<LevelSet>, k_speed: f32) -> Result<Self, String> {
         let mut env = Self {
             emu: Emulator::load(core, rom)?,
-            starts,
-            p_start,
-            rng: seed.wrapping_mul(0x9E3779B97F4A7C15) | 1,
-            current_start: 0,
+            levels,
+            level: 0,
+            k_speed,
+            timer_start: 0,
+            step_cap: 0,
             obs: vec![0; OBS_LEN],
             prev_x: 0,
             max_x: 0,
             steps: 0,
             stall: 0,
         };
-        env.reset()?;
+        env.reset_to(0)?;
         Ok(env)
     }
 
-    fn next_random(&mut self) -> u64 {
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 7;
-        self.rng ^= self.rng << 17;
-        self.rng
-    }
-
-    /// Index of the state the current episode began from (0 = real level start).
-    pub fn start_index(&self) -> usize {
-        self.current_start
+    /// Index of the level the current episode runs on.
+    pub fn level(&self) -> usize {
+        self.level
     }
 
     /// Mario's X position after the latest step.
@@ -194,19 +193,23 @@ impl MarioEnv {
         &self.emu
     }
 
+    /// Restart the current level.
     pub fn reset(&mut self) -> Result<&[u8], String> {
-        self.current_start = if self.starts.len() == 1 || (self.next_random() >> 40) as f32 / (1u64 << 24) as f32 <= self.p_start {
-            0
-        } else {
-            1 + (self.next_random() % (self.starts.len() as u64 - 1)) as usize
-        };
-        self.emu.load_state(&self.starts[self.current_start])?;
+        self.reset_to(self.level)
+    }
+
+    /// Start a new episode on `level` (an index into the level set).
+    pub fn reset_to(&mut self, level: usize) -> Result<&[u8], String> {
+        self.level = level;
+        self.emu.load_state(&self.levels.levels[level].state)?;
         self.emu.set_buttons(0);
         self.emu.run_frame(); // refresh the framebuffer after the state load
         self.prev_x = x_pos(&self.emu);
         self.max_x = self.prev_x;
         self.steps = 0;
         self.stall = 0;
+        self.timer_start = crate::ram::timer(self.emu.ram());
+        self.step_cap = crate::reward::step_cap(self.timer_start);
         let plane = OBS_W * OBS_H;
         grayscale_downscale(&self.emu, &mut self.obs[..plane]);
         for i in 1..STACK {
@@ -240,13 +243,18 @@ impl MarioEnv {
 
         let ram = self.emu.ram();
         let dying = ram[RAM_PLAYER_STATE] == PLAYER_DYING;
-        let cleared = ram[RAM_END_LEVEL_TIMER] != 0 || (game_mode(&self.emu) != MODE_IN_LEVEL && !dying);
+        // Goal timer only: doors and pipes also leave level mode but are not wins.
+        let cleared = ram[RAM_END_LEVEL_TIMER] != 0;
         let x = x_pos(&self.emu);
 
         self.steps += 1;
-        let dx = (x as i32 - self.prev_x as i32).clamp(-30, 30) as f32;
+        let raw_dx = x as i32 - self.prev_x as i32;
+        let dx = raw_dx.clamp(-30, 30) as f32;
         self.prev_x = x;
-        if x > self.max_x {
+        if raw_dx < -AREA_CHANGE_DX {
+            self.max_x = x; // new area: progress is measured from here
+            self.stall = 0;
+        } else if x > self.max_x {
             self.max_x = x;
             self.stall = 0;
         } else {
@@ -255,12 +263,12 @@ impl MarioEnv {
 
         let mut reward = dx * REWARD_PER_TILE - PENALTY_STEP;
         let outcome = if cleared {
-            reward += REWARD_CLEAR;
+            reward += crate::reward::clear_bonus(crate::ram::timer(self.emu.ram()), self.timer_start, self.k_speed);
             Outcome::Cleared
         } else if dying {
             reward -= PENALTY_DEATH;
             Outcome::Died
-        } else if self.steps >= MAX_STEPS || self.stall >= MAX_STALL {
+        } else if self.steps >= self.step_cap || self.stall >= MAX_STALL {
             Outcome::Timeout
         } else {
             Outcome::Running
