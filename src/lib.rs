@@ -1,5 +1,7 @@
 pub mod backend;
+pub mod augment;
 pub mod emulator;
+pub mod entities;
 pub mod levels;
 pub mod env;
 pub mod plr;

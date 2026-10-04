@@ -1,6 +1,7 @@
 //! Super Mario World environment: boot script, level selection, observations, actions, reward.
 
 use crate::emulator::{Emulator, button};
+use crate::entities::{ENT_LEN, entity_vector};
 use crate::levels::{Level, LevelSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -147,6 +148,8 @@ pub struct MarioEnv {
     step_cap: u32,
     /// `STACK` grayscale planes, oldest first.
     obs: Vec<u8>,
+    /// Entity vector of the latest frame (see `entities`).
+    ent: Vec<f32>,
     prev_x: u16,
     max_x: u16,
     steps: u32,
@@ -170,6 +173,7 @@ impl MarioEnv {
             timer_start: 0,
             step_cap: 0,
             obs: vec![0; OBS_LEN],
+            ent: vec![0.0; ENT_LEN],
             prev_x: 0,
             max_x: 0,
             steps: 0,
@@ -215,6 +219,7 @@ impl MarioEnv {
         for i in 1..STACK {
             self.obs.copy_within(..plane, i * plane);
         }
+        entity_vector(self.emu.ram(), &mut self.ent);
         Ok(&self.obs)
     }
 
@@ -224,6 +229,10 @@ impl MarioEnv {
 
     pub fn observation(&self) -> &[u8] {
         &self.obs
+    }
+
+    pub fn entities(&self) -> &[f32] {
+        &self.ent
     }
 
     pub fn step(&mut self, action: usize) -> StepResult {
@@ -240,6 +249,7 @@ impl MarioEnv {
         let plane = OBS_W * OBS_H;
         self.obs.copy_within(plane.., 0);
         grayscale_downscale(&self.emu, &mut self.obs[(STACK - 1) * plane..]);
+        entity_vector(self.emu.ram(), &mut self.ent);
 
         let ram = self.emu.ram();
         let dying = ram[RAM_PLAYER_STATE] == PLAYER_DYING;

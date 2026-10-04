@@ -2,6 +2,7 @@
 //! because the core keeps global state, so a shared handle would be one emulator.
 //! Workers pick the level of each new episode from a shared `LevelSampler`.
 
+use crate::entities::ENT_LEN;
 use crate::env::{MarioEnv, OBS_LEN, Outcome, StepResult};
 use crate::levels::LevelSet;
 use crate::plr::SharedSampler;
@@ -23,6 +24,7 @@ pub struct EpisodeInfo {
 struct Reply {
     id: usize,
     obs: Vec<u8>,
+    ent: Vec<f32>,
     reward: f32,
     done: bool,
     info: Option<EpisodeInfo>,
@@ -38,6 +40,8 @@ pub struct VecEnv {
     workers: Vec<JoinHandle<()>>,
     /// Latest observation of every env, `n * OBS_LEN` bytes.
     pub obs: Vec<u8>,
+    /// Latest entity vector of every env, `n * ENT_LEN` floats.
+    pub ent: Vec<f32>,
     /// Level of the episode each env is currently in.
     pub levels: Vec<usize>,
     pub n: usize,
@@ -64,7 +68,7 @@ fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, levels: 
     let _ = std::fs::remove_file(&core); // the library stays mapped after unlinking
     let first = sampler.lock().expect("sampler").sample(&mut rng);
     let _ = env.reset_to(first);
-    let _ = replies.send(Reply { id, obs: env.observation().to_vec(), reward: 0.0, done: false, info: None, level: env.level(), step_level: env.level() });
+    let _ = replies.send(Reply { id, obs: env.observation().to_vec(), ent: env.entities().to_vec(), reward: 0.0, done: false, info: None, level: env.level(), step_level: env.level() });
     let (mut ret, mut steps) = (0.0f32, 0u32);
     while let Ok(action) = commands.recv() {
         let step_level = env.level();
@@ -79,7 +83,7 @@ fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, levels: 
             ret = 0.0;
             steps = 0;
         }
-        if replies.send(Reply { id, obs: env.observation().to_vec(), reward, done, info, level: env.level(), step_level }).is_err() {
+        if replies.send(Reply { id, obs: env.observation().to_vec(), ent: env.entities().to_vec(), reward, done, info, level: env.level(), step_level }).is_err() {
             break;
         }
     }
@@ -100,13 +104,15 @@ impl VecEnv {
         }
         drop(reply_tx);
         let mut obs = vec![0u8; n * OBS_LEN];
+        let mut ent = vec![0.0f32; n * ENT_LEN];
         let mut level_of = vec![0usize; n];
         for _ in 0..n {
             let r = replies.recv().map_err(|_| "a worker failed to start".to_string())?;
             obs[r.id * OBS_LEN..(r.id + 1) * OBS_LEN].copy_from_slice(&r.obs);
+            ent[r.id * ENT_LEN..(r.id + 1) * ENT_LEN].copy_from_slice(&r.ent);
             level_of[r.id] = r.level;
         }
-        Ok(Self { commands, replies, workers, obs, levels: level_of, n })
+        Ok(Self { commands, replies, workers, obs, ent, levels: level_of, n })
     }
 
     pub fn step(&mut self, actions: &[usize]) -> StepBatch {
@@ -117,6 +123,7 @@ impl VecEnv {
         for _ in 0..self.n {
             let r = self.replies.recv().expect("worker died");
             self.obs[r.id * OBS_LEN..(r.id + 1) * OBS_LEN].copy_from_slice(&r.obs);
+            self.ent[r.id * ENT_LEN..(r.id + 1) * ENT_LEN].copy_from_slice(&r.ent);
             self.levels[r.id] = r.level;
             batch.rewards[r.id] = r.reward;
             batch.dones[r.id] = r.done;
