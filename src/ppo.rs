@@ -96,30 +96,9 @@ impl<B: Backend> NatureTrunk<B> {
 }
 
 #[derive(Module, Debug)]
-pub struct ResBlock<B: Backend> {
-    conv1: Conv2d<B>,
-    conv2: Conv2d<B>,
-}
-
-impl<B: Backend> ResBlock<B> {
-    fn new(ch: usize, device: &B::Device) -> Self {
-        let conv = || Conv2dConfig::new([ch, ch], [3, 3]).with_padding(PaddingConfig2d::Same).init(device);
-        Self { conv1: conv(), conv2: conv() }
-    }
-
-    fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let y = self.conv1.forward(relu(x.clone()));
-        let y = self.conv2.forward(relu(y));
-        x + y
-    }
-}
-
-#[derive(Module, Debug)]
 pub struct ImpalaStage<B: Backend> {
     conv: Conv2d<B>,
     pool: MaxPool2d,
-    res1: ResBlock<B>,
-    res2: ResBlock<B>,
 }
 
 impl<B: Backend> ImpalaStage<B> {
@@ -127,18 +106,15 @@ impl<B: Backend> ImpalaStage<B> {
         Self {
             conv: Conv2dConfig::new([c_in, c_out], [3, 3]).with_padding(PaddingConfig2d::Same).init(device),
             pool: MaxPool2dConfig::new([3, 3]).with_strides([2, 2]).with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1)).init(),
-            res1: ResBlock::new(c_out, device),
-            res2: ResBlock::new(c_out, device),
         }
     }
 
     fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let x = self.pool.forward(self.conv.forward(x));
-        self.res2.forward(self.res1.forward(x))
+        self.pool.forward(relu(self.conv.forward(x)))
     }
 }
 
-/// IMPALA-CNN: three conv/pool/residual stages. 84x84 input becomes 11x11 feature maps.
+/// IMPALA-CNN: three conv/pool stages. 84x84 input becomes 11x11 feature maps.
 #[derive(Module, Debug)]
 pub struct ImpalaTrunk<B: Backend> {
     stages: Vec<ImpalaStage<B>>,
