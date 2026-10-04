@@ -1,0 +1,11 @@
+/target
+
+# ROMs and emulator saves: never commit
+*.sfc
+*.smc
+*.fig
+*.swc
+*.zip
+*.srm
+*.state
+roms/
