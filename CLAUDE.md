@@ -25,6 +25,9 @@ Rust has no mature SNES emulator crate, so the emulator integration is the first
 - Preferred approach: load a **libretro core** (snes9x or bsnes) through a thin Rust libretro host. It gives frames, input, save states, and RAM access through one API.
 - Required capabilities: step N frames, set joypad input, read RAM, save and load state, grab the framebuffer.
 - Build this as its own module behind an `Env` trait (`reset`, `step(action) -> (obs, reward, done)`) so the agent code does not know which emulator sits underneath.
+- **Status:** `src/emulator.rs` is a working hand-written libretro host (`libloading`, no libretro crate: the crates.io ones are for writing cores). Proven with snes9x at `/usr/lib/libretro/snes9x_libretro.so` (pacman `libretro-snes9x`): frames, input, work RAM, save-state round trip.
+- **Speed:** about 1800 fps per core on the dev machine (30x realtime), one emulator, no rendering to screen. Compare against Colab VM cores before choosing a platform.
+- **Gotchas:** snes9x refuses to load unless the host accepts its requested pixel format (RGB565), so the host accepts all three formats. The ROM shows black for about 5 s (300 frames) at boot. The core keeps global state, so parallel envs need one process each, or a uniquely named copy of the `.so` per env.
 - The ROM is supplied by the user, kept out of git (ROM extensions in `.gitignore`; it sits in the repo root), and is never committed or uploaded.
 
 ## Environment design
