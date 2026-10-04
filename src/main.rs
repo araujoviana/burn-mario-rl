@@ -1,4 +1,4 @@
-mod emulator;
+use burn_mario_rl::emulator;
 
 use emulator::{Emulator, button};
 use std::path::PathBuf;

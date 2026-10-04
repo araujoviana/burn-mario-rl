@@ -218,6 +218,14 @@ impl Emulator {
         unsafe { (self.reset)() }
     }
 
+    /// Borrow the latest frame as `(rgb, width, height)` without copying.
+    pub fn with_frame<R>(&self, f: impl FnOnce(&[u8], u32, u32) -> R) -> R {
+        SHARED.with(|s| {
+            let s = s.borrow();
+            f(&s.frame, s.width, s.height)
+        })
+    }
+
     /// Latest frame as `(rgb, width, height)`.
     pub fn frame(&self) -> (Vec<u8>, u32, u32) {
         SHARED.with(|s| {

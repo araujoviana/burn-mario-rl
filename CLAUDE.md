@@ -4,7 +4,7 @@ Reinforcement learning agent that beats the first level of Super Mario World (SN
 
 ## Goal and priorities
 
-1. **Milestone 1:** the agent clears the first level (Yoshi's Island 2). Nothing else matters until this works.
+1. **Milestone 1:** the agent clears the first level (the one after Yoshi's House; the map labels it Yoshi's Island 1). Nothing else matters until this works.
 2. **Deliverable:** a clean MP4 of a winning run, recorded at native resolution, upscaled for posting.
 3. **Speed of learning:** the user wants wall-clock training to be short. Pick the fastest GPU Colab offers and favor sample-efficient choices over elegant ones.
 
@@ -15,6 +15,7 @@ Out of scope until Milestone 1 is done: other levels, generalization, multi-game
 - **Primary:** Rust + Burn.
 - **Fallback:** Python (stable-retro + PyTorch / Stable-Baselines3). Switch only when the Rust path is blocked, most likely by emulator bindings. Record the blocker in this file when switching.
 - **Training runs on a Colab VM with a GPU**, headless. Use the `colab-operator` skill for sessions, file sync, and shell on the VM. Local machine is for development and smoke tests.
+- **Compute plan:** emulation is CPU-bound (about 430 agent steps/s per core), so favor a big pay-per-use CPU VM (Huawei Cloud or Colab) with many parallel env processes, killed right after the run. The user is fine with a large VM for under an hour. A modest GPU handles PPO updates.
 - **GPU:** the user has Colab Pro. An A100 may be overkill for a small CNN policy, since emulation on the CPU is often the bottleneck. Benchmark steps/sec on L4, T4 and A100 for one short run each, then pick the cheapest that keeps the GPU busy. Log the results here.
 - Burn backend: `burn-cuda` or `wgpu` on Colab; `ndarray` locally for tests. Keep the backend a generic parameter so code is not tied to one.
 
@@ -23,6 +24,7 @@ Out of scope until Milestone 1 is done: other levels, generalization, multi-game
 Rust has no mature SNES emulator crate, so the emulator integration is the first thing to de-risk.
 
 - Preferred approach: load a **libretro core** (snes9x or bsnes) through a thin Rust libretro host. It gives frames, input, save states, and RAM access through one API.
+- Scratch tools live in `examples/` (`explore` probes menus by RAM, `env_check` runs random episodes, `record_random` records a clear to video).
 - Required capabilities: step N frames, set joypad input, read RAM, save and load state, grab the framebuffer.
 - Build this as its own module behind an `Env` trait (`reset`, `step(action) -> (obs, reward, done)`) so the agent code does not know which emulator sits underneath.
 - **Status:** `src/emulator.rs` is a working hand-written libretro host (`libloading`, no libretro crate: the crates.io ones are for writing cores). Proven with snes9x at `/usr/lib/libretro/snes9x_libretro.so` (pacman `libretro-snes9x`): frames, input, work RAM, save-state round trip.
@@ -33,6 +35,10 @@ Rust has no mature SNES emulator crate, so the emulator integration is the first
 ## Environment design
 
 - Start from a **save state at level start**; `reset` loads it. This also removes the need for lives to matter, since a death returns to the level start anyway.
+- **Status:** `src/env.rs` implements this and is verified. `level_start_state` plays the menus from power-on by watching game mode (`$7E0100`), and the state is cached in `level1.state` (gitignored; regenerate with `cargo run --release --example env_check`). Reward weights and caps are constants at the top of `env.rs`.
+- **Verified clear detection:** `$1493 != 0` (or leaving level mode without dying) fires at the goal gate, and the game then shows COURSE CLEAR. Death is player state `$71 == 9`.
+- **Difficulty:** a biased-random policy (mostly run+jump right) clears the level about 1 episode in 4, in about 650 agent steps. Expect fast learning; if training stalls, suspect a bug before the algorithm.
+- **Buttons:** B jumps, Y runs (SNES layout). A is spin jump and is not in the action set.
 - **Frame skip** 4 and **frame stack** 4, grayscale, downscaled (about 84x84).
 - **Discrete action set** of a few button combos (right, right+B run, right+A jump, right+B+A, none). Keep it small.
 - **Reward** from RAM, not pixels: progress in X position per step, a bonus on level clear, a penalty on death, a small time penalty. Reward shaping drives sample efficiency.
