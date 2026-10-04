@@ -21,6 +21,16 @@ The spike finished and changed the warp mechanism, so Tasks 2 and 4 below are wr
 - Verified in `ram.rs`: Mario X/Y, signed speeds, `blocked & 4` = on ground, vertical flag `$5B & 1`, timer digits `$0F31-33`, sprite tables. `examples/warp_probe.rs` reproduces all of it.
 - API that exists now: `Emulator::write_ram`, `env::overworld_state`, `ram::warp_to_position(emu, overworld, x, y) -> Result<Vec<u8>, String>`.
 
+## Task 2 outcome (done, 2026-10-04)
+
+`make_levels` scans the 32x32 map grid and writes `levels/` (gitignored). After inspecting every level (`examples/inspect_levels.rs`, `examples/clear_probe.rs`) the pool is **21 levels, 4 held out** (tl `0x39 0x3c 0x54 0x5a`). Findings that shaped it and the tasks below:
+
+- Four map tiles (tl `0x30 0x36 0x48 0x4d`) load the **same placeholder level** (identical start frames, a dead end at x=744). `make_levels` now keeps one copy, found by hashing the start frame. Before this, one copy sat in the held-out set.
+- Progress filter raised from x>=300 to x>=400 for the best of 3 random tries. Random-policy numbers are noisy: tl `0x3b` (lava cave) passed it once but 20 tries average a death at x~95. It is kept but is **near-impossible for a random policy**; if PLR over-samples it (death-heavy levels get high |GAE|), cap the score or drop it. Watch its per-level clear rate in the first run.
+- **The old clear rule gives false wins.** `cleared = $1493 != 0 || (mode != 0x14 && !dying)`: two door-ended castle rooms (tl `0x3f`, `0x45`) end at a door at x=736 that loads a sub-area (mode `0x0F`) with no goal timer. Task 4 therefore uses **`$1493 != 0` only**. Entering a door or pipe is not a terminal event; the episode continues in the new area.
+- tl `0x56` is a legitimately tiny level (goal at x~473, ~60 steps). Fine, and the clear fires at the goal (`$1493` set), not at load.
+- Underwater (tl `0x54`) and dark (tl `0x39`) levels are in the pool and stall a random policy (timeouts at x=2450 and x=514); they may be hard for reasons other than skill.
+
 ## Global Constraints
 
 - Level pool: 15+ levels, 3-4 held out for a generalization score. If fewer than 15 pass the filter in Task 2, keep going and report the real number.
@@ -473,6 +483,14 @@ Constructors:
 ```
 
 - [ ] **Step 3: Reward wiring in `step_with`**
+
+First fix the clear rule. In `step_with`, replace the `cleared` line with a goal-timer-only check (door and pipe transitions change the game mode but are not wins; see the Task 2 outcome):
+
+```rust
+        let cleared = ram[RAM_END_LEVEL_TIMER] != 0;
+```
+
+Then make this change to the outcome/reward code:
 
 Remove the `REWARD_CLEAR` and `MAX_STEPS` constants from `env.rs` (they move to `reward.rs`). In `step_with` change the clear and timeout branches:
 

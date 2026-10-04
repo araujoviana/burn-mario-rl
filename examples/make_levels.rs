@@ -5,7 +5,12 @@ use burn_mario_rl::emulator::Emulator;
 use burn_mario_rl::env::{ACTIONS, FRAME_SKIP, overworld_state};
 use burn_mario_rl::levels::{Level, LevelSet, assign_split};
 use burn_mario_rl::ram::{self, warp_to_position};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+
+/// A biased-random policy must get at least this far (absolute X; levels start near x=16).
+const MIN_PROGRESS_X: u16 = 400;
 
 fn main() -> Result<(), String> {
     let core = PathBuf::from(std::env::var("CORE").unwrap_or("/usr/lib/libretro/snes9x_libretro.so".into()));
@@ -17,6 +22,7 @@ fn main() -> Result<(), String> {
     // (translevel, x, y, state); the same level can be reached from one tile only, but guard anyway.
     let mut kept: Vec<(u8, u16, u16, Vec<u8>)> = Vec::new();
     let mut seen_tl = std::collections::HashSet::new();
+    let mut seen_frames = std::collections::HashMap::new();
     for ty in 0..32u16 {
         for tx in 0..32u16 {
             let (x, y) = (tx * 16 + 8, ty * 16 + 8);
@@ -26,6 +32,14 @@ fn main() -> Result<(), String> {
             };
             let tl = emu.ram()[ram::TRANSLEVEL];
             if !seen_tl.insert(tl) {
+                continue;
+            }
+            // Several unused map tiles load the same placeholder level; keep one copy of each.
+            let mut hasher = DefaultHasher::new();
+            emu.frame().0.hash(&mut hasher);
+            let first = *seen_frames.entry(hasher.finish()).or_insert(tl);
+            if first != tl {
+                println!("({x:3},{y:3}) tl {tl:#04x}: skip (same level as tl {first:#04x})");
                 continue;
             }
             if ram::is_vertical(emu.ram()) {
@@ -52,7 +66,7 @@ fn main() -> Result<(), String> {
                 }
             }
             emu.set_buttons(0);
-            if best < 300 {
+            if best < MIN_PROGRESS_X {
                 println!("({x:3},{y:3}) tl {tl:#04x}: skip (random policy reached only x={best})");
                 continue;
             }
