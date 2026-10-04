@@ -32,17 +32,20 @@ fn main() -> Result<(), String> {
     let rom = PathBuf::from(cfg("ROM", "Super Mario World (USA).sfc".to_string()));
     let state = std::fs::read(cfg("STATE", "level1.state".to_string())).map_err(|e| format!("read state (run env_check first): {e}"))?;
     let mut rng: u64 = cfg("SEED", 0x2545F4914F6CDD1D);
-    let hyper = Hyper { lr: cfg("LR", 2.5e-4), clip: 0.2, value_coef: 0.5, entropy_coef: cfg("ENTROPY", 0.01), epochs: 4, minibatches: 4 };
-    let (gamma, lambda) = (0.99f32, 0.95f32);
+    let hyper = Hyper { lr: cfg("LR", 2.5e-4), clip: 0.2, value_coef: 0.5, entropy_coef: cfg("ENTROPY", 0.01), epochs: cfg("EPOCHS", 4), minibatches: cfg("MINIBATCHES", 4) };
+    let (gamma, lambda): (f32, f32) = (cfg("GAMMA", 0.99), cfg("LAMBDA", 0.95));
+    let ckpt_dir: String = cfg("CKPT_DIR", "checkpoints".to_string());
+    // Keeps value targets near O(1); reported episode returns stay in raw reward units.
+    let reward_scale: f32 = cfg("REWARD_SCALE", 0.1);
 
     let device = Default::default();
     println!("backend {}", burn_mario_rl::backend::name());
     let mut model = ActorCritic::<B>::new(&device);
     let mut optim = AdamConfig::new().with_epsilon(1e-5).with_grad_clipping(Some(GradientClippingConfig::Norm(0.5))).init();
-    std::fs::create_dir_all("checkpoints").map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&ckpt_dir).map_err(|e| e.to_string())?;
 
     let mut envs = VecEnv::new(n, &core, &rom, &state)?;
-    println!("{n} envs up, rollout {rollout}, {} steps per iteration", n * rollout);
+    println!("{n} envs up, rollout {rollout}, {} steps per iteration, {} updates per iteration, lr {}, gamma {gamma}, lambda {lambda}", n * rollout, hyper.epochs * hyper.minibatches, hyper.lr);
 
     let batch_size = n * rollout;
     let mut obs_buf = vec![0u8; batch_size * OBS_LEN];
@@ -72,7 +75,9 @@ fn main() -> Result<(), String> {
             }
             values[range.clone()].copy_from_slice(&value);
             let step = envs.step(&chosen);
-            rewards[range.clone()].copy_from_slice(&step.rewards);
+            for (dst, r) in rewards[range.clone()].iter_mut().zip(&step.rewards) {
+                *dst = r * reward_scale;
+            }
             dones[range].copy_from_slice(&step.dones);
             for info in step.finished {
                 recent.push_back(info);
@@ -132,13 +137,13 @@ fn main() -> Result<(), String> {
         );
         if recent.len() >= 20 && mean_ret > best_mean {
             best_mean = mean_ret;
-            model.clone().save_file("checkpoints/best", &CompactRecorder::new()).map_err(|e| e.to_string())?;
+            model.clone().save_file(format!("{ckpt_dir}/best"), &CompactRecorder::new()).map_err(|e| e.to_string())?;
         }
         if iter % 10 == 0 {
-            model.clone().save_file("checkpoints/latest", &CompactRecorder::new()).map_err(|e| e.to_string())?;
+            model.clone().save_file(format!("{ckpt_dir}/latest"), &CompactRecorder::new()).map_err(|e| e.to_string())?;
         }
     }
-    model.save_file("checkpoints/latest", &CompactRecorder::new()).map_err(|e| e.to_string())?;
+    model.save_file(format!("{ckpt_dir}/latest"), &CompactRecorder::new()).map_err(|e| e.to_string())?;
     println!("done: {steps_done} steps in {:.0}s", start.elapsed().as_secs_f32());
     Ok(())
 }

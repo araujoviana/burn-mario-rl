@@ -1,5 +1,6 @@
 //! Plays a checkpoint and records the first cleared episode to a video.
-//! Env vars: CKPT (default checkpoints/best), OUT (default win.mp4), EPISODES, ARGMAX (1 = greedy), CORE, ROM, STATE.
+//! Env vars: CKPT (default checkpoints/best), OUT (default win.mp4), EPISODES, ARGMAX (1 = greedy),
+//! ANY (1 = if nothing clears, keep the attempt that got furthest), CORE, ROM, STATE.
 
 use burn::module::Module;
 use burn::record::CompactRecorder;
@@ -46,6 +47,8 @@ fn main() -> Result<(), String> {
     let out: String = cfg("OUT", "win.mp4".to_string());
     let episodes: u32 = cfg("EPISODES", 20);
     let greedy: bool = cfg::<u8>("ARGMAX", 0) == 1;
+    let keep_best_attempt: bool = cfg::<u8>("ANY", 0) == 1;
+    let mut best_x = 0u16;
     let device = Default::default();
     let model = ActorCritic::<Inner>::new(&device)
         .load_file(cfg("CKPT", "checkpoints/best".to_string()), &CompactRecorder::new(), &device)
@@ -83,10 +86,11 @@ fn main() -> Result<(), String> {
         println!("episode {ep:3}: {outcome:?} in {steps} steps, return {ret:.1}, max_x {}", env.max_x());
         if let Some(rec) = rec {
             rec.finish();
-            if outcome == Outcome::Cleared {
+            if outcome == Outcome::Cleared || (keep_best_attempt && env.max_x() > best_x) {
+                best_x = best_x.max(env.max_x());
                 std::fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
-                println!("  -> recorded {out}");
-                saved = true;
+                println!("  -> recorded {out} ({outcome:?})");
+                saved = outcome == Outcome::Cleared;
             } else {
                 let _ = std::fs::remove_file(&tmp);
             }

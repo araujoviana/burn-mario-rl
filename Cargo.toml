@@ -10,5 +10,5 @@ libloading = "0.9.0"
 [features]
 flex = ["burn/flex"]
 tch = ["burn/tch"]
-cuda = ["burn/cuda"]
+cuda = ["burn/cuda", "burn/fusion", "burn/autotune"]
 wgpu = ["burn/wgpu"]
