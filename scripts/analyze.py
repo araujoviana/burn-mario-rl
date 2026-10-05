@@ -9,10 +9,16 @@ import json, sys, collections
 ACTIONS = ["none", "right", "right+B", "right+Y", "right+Y+B", "B", "left", "down", "up", "right+A", "right+Y+A"]
 
 def load(path):
+    out = []
     try:
-        return [json.loads(l) for l in open(path) if l.strip()]
+        for l in open(path):
+            try:
+                out.append(json.loads(l))
+            except json.JSONDecodeError:
+                pass  # a line cut off while the run was still writing it
     except FileNotFoundError:
-        return []
+        pass
+    return out
 
 def main():
     run = sys.argv[1]
