@@ -1,5 +1,5 @@
 //! PPO training on a level set with PLR, entity inputs and DrAC augmentation.
-//! Env vars: ENVS, ROLLOUT, TOTAL_STEPS, LR, CORE, ROM, SEED, INIT, CKPT_DIR, LEVELS, PLR, PLR_TEMP, PLR_RHO,
+//! Env vars: ENVS, ROLLOUT, TOTAL_STEPS, LR, CORE, ROM, SEED, INIT, CKPT_DIR, LEVELS, EXCLUDE, PLR, PLR_TEMP, PLR_RHO,
 //! PLR_EMA, SPEED_K, AUG_PAD, AUG_COEF, EVAL_EVERY, EVAL_ENVS, EVAL_STEPS, TRUNK, WIDTH, ENTITIES.
 
 use burn::module::{AutodiffModule, Module};
@@ -66,7 +66,9 @@ fn main() -> Result<(), String> {
     let rom = PathBuf::from(cfg("ROM", "Super Mario World (USA).sfc".to_string()));
 
     let levels = Arc::new(LevelSet::load(Path::new(&cfg("LEVELS", "levels".to_string())))?);
-    let train_ids = levels.train_ids();
+    // EXCLUDE=8,12 drops levels from training (they stay out of the held-out set too).
+    let excluded: Vec<usize> = cfg("EXCLUDE", String::new()).split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    let train_ids: Vec<usize> = levels.train_ids().into_iter().filter(|id| !excluded.contains(id)).collect();
     let held_ids = levels.held_out_ids();
     println!("levels: {} train, {} held out", train_ids.len(), held_ids.len());
     let plr_cfg = PlrConfig { enabled: cfg::<u8>("PLR", 1) == 1, temperature: cfg("PLR_TEMP", 0.3), rho: cfg("PLR_RHO", 0.1), ema: cfg("PLR_EMA", 0.3) };
