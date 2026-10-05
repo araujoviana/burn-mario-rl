@@ -276,6 +276,11 @@ impl MarioEnv {
         Ok(env)
     }
 
+    /// Number of levels in the set.
+    pub fn level_count(&self) -> usize {
+        self.levels.levels.len()
+    }
+
     /// Index of the level the current episode runs on.
     pub fn level(&self) -> usize {
         self.level

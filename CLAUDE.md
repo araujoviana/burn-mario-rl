@@ -98,3 +98,13 @@ Probably unnecessary: reset from a save state handles death. If lives still matt
 - 11 actions (`vm_ext5`) learned slower than 7 (L7 71%, L6 4% at 4.3M). Timeout penalty 25 vs 15 made little difference. L1 and L20 still stall (86-95% timeouts); L3, L10, L13, L18 die at the same pits.
 - Held-out (20 attempts each, `vm_ext8` at 3.5M): L14 2/20, L4 0/20 (furthest x 1238), L9 0/20 (962), L19 0/20 (1405). First sign of transfer, but only 2 clears.
 - Checkpoints and telemetry of every arm are in `runs/vm_ext<n>/`, logs in `runs/vm_logs/` (untracked). Videos of the levels beaten: `runs/videos/grid/levels_beaten.mp4`.
+
+### Stop point (2026-10-05, afternoon): where to resume
+
+- **Best checkpoint:** `runs/vm_ext8/stop_point.mpk` (frame skip 8, about 10.7M steps, `net.cfg` = `gridmlp 1 1`). From the level start: L7 97%, L0 87%, L6 84%, L10 38%, L16 39%; everything else 0%. Second arm `runs/vm_ext9/` (frame skip 12, 5.3M steps) is close behind. Win action lists (verified replays) are in `runs/vm_ext8/wins/` (24 files, L0, L6, L7, L10, L16) and `runs/vm_ext9/wins/`.
+- **Resume ext8** (7 actions build, `cargo build --release --features cuda` on the VM or `--features flex` locally; levels and the ROM must be present; on the VM `CORE=/root/cores/snes9x_libretro.so`):
+  `INIT=runs/vm_ext8/stop_point TRUNK=gridmlp ENTITIES=1 PLR=0 FRONTIER=0.5 PATH_SHARE=0.25 EXPLORE_BONUS=1.0 TIMEOUT_PENALTY=15 FRAME_SKIP=8 GAMMA=0.98 ENVS=30 ROLLOUT=128 EPOCHS=4 WINS_DIR=runs/vm_ext8/wins CKPT_DIR=runs/<new dir> ./train`.
+  `WINS_DIR` makes the first worker replay the saved wins at startup and rebuild the win paths (the archive itself is in memory only). The path start fraction restarts at 10% and moves back quickly. The frontier cells refill within minutes.
+- **Evaluate** a checkpoint with the same frame skip: `FRAME_SKIP=8 CKPT=<path without .mpk> LEVEL=<id> EPISODES=40 OUT=clip.mp4 eval`.
+- **VM:** `mario-vm` was stopped (not deleted) at this point; the disk keeps `/root/proj`, `/root/target_new` (7 actions, CUDA) and `/root/target_ext` (11 actions). Start it again from the Huawei console or the API (`batch_start_servers`, region `la-south-2`, server id in the memory notes); ssh works with the saved key once it is up.
+- **Next steps:** (1) resume ext8 and see whether L3, L13, L18 (pit deaths at the same x) get a first win; (2) held-out progress metric in the log (clears alone hide movement); (3) human demonstrations of the stuck levels, `docs/ideas/2026-10-05-human-demonstrations.md`; (4) possibly a recurrent policy for waiting and platform timing.

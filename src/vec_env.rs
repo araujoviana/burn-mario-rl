@@ -97,6 +97,31 @@ fn record_win(env: &mut MarioEnv, level: usize, trace: &[u8], fr: &Frontier) {
     fr.archive.lock().expect("archive").offer_path(level, trace.len() as u32, states);
 }
 
+/// On resume: replays the shortest saved win of every level (`$WINS_DIR`, default `$CKPT_DIR/wins`) to rebuild
+/// the win paths, which otherwise live only in memory. Files are named `level<index>_<n>steps.actions`.
+fn load_saved_wins(env: &mut MarioEnv, fr: &Frontier) {
+    let dir = std::env::var("WINS_DIR").unwrap_or_else(|_| format!("{}/wins", std::env::var("CKPT_DIR").unwrap_or_else(|_| ".".into())));
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let mut best: std::collections::HashMap<usize, (usize, std::path::PathBuf)> = std::collections::HashMap::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("level").and_then(|r| r.strip_suffix("steps.actions")) else { continue };
+        let Some((level, steps)) = rest.split_once('_') else { continue };
+        if let (Ok(level), Ok(steps)) = (level.parse::<usize>(), steps.parse::<usize>()) {
+            if best.get(&level).is_none_or(|(s, _)| steps < *s) {
+                best.insert(level, (steps, e.path()));
+            }
+        }
+    }
+    for (level, (_, path)) in best {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let trace: Vec<u8> = text.trim().split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        if !trace.is_empty() && level < env.level_count() {
+            record_win(env, level, &trace, fr);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, levels: Arc<LevelSet>, sampler: SharedSampler, frontier: Option<Frontier>, k_speed: f32, seed: u64, commands: Receiver<usize>, replies: Sender<Reply>) {
     let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
@@ -108,6 +133,11 @@ fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, levels: 
         }
     };
     let _ = std::fs::remove_file(&core); // the library stays mapped after unlinking
+    if id == 0 {
+        if let Some(fr) = &frontier {
+            load_saved_wins(&mut env, fr);
+        }
+    }
     let first = sampler.lock().expect("sampler").sample(&mut rng);
     let _ = env.reset_to(first);
     let _ = replies.send(Reply { id, obs: env.observation().to_vec(), ent: env.entities().to_vec(), reward: 0.0, done: false, info: None, level: env.level(), step_level: env.level() });
