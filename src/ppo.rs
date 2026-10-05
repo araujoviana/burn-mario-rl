@@ -1,7 +1,9 @@
 //! Actor-critic network (IMPALA or Nature CNN trunk, optional entity branch) and the PPO update.
 
 use crate::entities::ENT_LEN;
-use crate::env::{ACTIONS, OBS_H, OBS_LEN, OBS_W, STACK};
+use crate::env::{ACTIONS, STACK};
+use crate::grid::{GRID_C, GRID_H, GRID_W};
+use crate::obs::{self, ObsKind};
 use burn::module::AutodiffModule;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::pool::{MaxPool2d, MaxPool2dConfig};
@@ -17,6 +19,16 @@ pub const NUM_ACTIONS: usize = ACTIONS.len();
 pub enum TrunkKind {
     Nature,
     Impala,
+    /// Small convnet over the RAM tile grid (`grid.rs`); needs `obs::ObsKind::Grid`.
+    Grid,
+    /// The same grid through two dense layers: much cheaper on a CPU backend than the convs.
+    GridMlp,
+}
+
+impl TrunkKind {
+    pub fn obs_kind(self) -> ObsKind {
+        if matches!(self, TrunkKind::Grid | TrunkKind::GridMlp) { ObsKind::Grid } else { ObsKind::Pixels }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +52,8 @@ impl NetConfig {
         let trunk = match std::env::var("TRUNK").as_deref() {
             Ok("nature") => TrunkKind::Nature,
             Ok("impala") => TrunkKind::Impala,
+            Ok("grid") => TrunkKind::Grid,
+            Ok("gridmlp") => TrunkKind::GridMlp,
             _ => d.trunk,
         };
         let width = std::env::var("WIDTH").ok().and_then(|v| v.parse().ok()).unwrap_or(d.width);
@@ -48,7 +62,7 @@ impl NetConfig {
     }
 
     pub fn to_line(&self) -> String {
-        format!("{} {} {}", if self.trunk == TrunkKind::Nature { "nature" } else { "impala" }, self.width, self.entities as u8)
+        format!("{} {} {}", match self.trunk { TrunkKind::Nature => "nature", TrunkKind::Impala => "impala", TrunkKind::Grid => "grid", TrunkKind::GridMlp => "gridmlp" }, self.width, self.entities as u8)
     }
 
     pub fn from_line(line: &str) -> Option<Self> {
@@ -56,6 +70,8 @@ impl NetConfig {
         let trunk = match *f.first()? {
             "nature" => TrunkKind::Nature,
             "impala" => TrunkKind::Impala,
+            "grid" => TrunkKind::Grid,
+            "gridmlp" => TrunkKind::GridMlp,
             _ => return None,
         };
         Some(Self { trunk, width: f.get(1)?.parse().ok()?, entities: *f.get(2)? != "0" })
@@ -138,10 +154,58 @@ impl<B: Backend> ImpalaTrunk<B> {
     }
 }
 
+/// Two small convs over the `[GRID_C, GRID_H, GRID_W]` tile grid, then a 128-unit layer.
+#[derive(Module, Debug)]
+pub struct GridTrunk<B: Backend> {
+    conv1: Conv2d<B>,
+    conv2: Conv2d<B>,
+    fc: Linear<B>,
+}
+
+const GRID_OUT_H: usize = GRID_H.div_ceil(2);
+const GRID_OUT_W: usize = GRID_W.div_ceil(2);
+
+impl<B: Backend> GridTrunk<B> {
+    fn new(width: usize, device: &B::Device) -> Self {
+        let (c1, c2) = (16 * width, 32 * width);
+        Self {
+            conv1: Conv2dConfig::new([GRID_C, c1], [3, 3]).with_padding(PaddingConfig2d::Same).init(device),
+            conv2: Conv2dConfig::new([c1, c2], [3, 3]).with_stride([2, 2]).with_padding(PaddingConfig2d::Same).init(device),
+            fc: LinearConfig::new(c2 * GRID_OUT_H * GRID_OUT_W, 128).init(device),
+        }
+    }
+
+    fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 2> {
+        let x = relu(self.conv1.forward(x));
+        let x = relu(self.conv2.forward(x));
+        let [batch, c, h, w] = x.dims();
+        relu(self.fc.forward(x.reshape([batch, c * h * w])))
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct GridMlpTrunk<B: Backend> {
+    fc1: Linear<B>,
+    fc2: Linear<B>,
+}
+
+impl<B: Backend> GridMlpTrunk<B> {
+    fn new(width: usize, device: &B::Device) -> Self {
+        Self { fc1: LinearConfig::new(GRID_C * GRID_H * GRID_W, 256 * width).init(device), fc2: LinearConfig::new(256 * width, 128).init(device) }
+    }
+
+    fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 2> {
+        let [batch, c, h, w] = x.dims();
+        relu(self.fc2.forward(relu(self.fc1.forward(x.reshape([batch, c * h * w])))))
+    }
+}
+
 #[derive(Module, Debug)]
 pub enum Trunk<B: Backend> {
     Nature(NatureTrunk<B>),
     Impala(ImpalaTrunk<B>),
+    Grid(GridTrunk<B>),
+    GridMlp(GridMlpTrunk<B>),
 }
 
 const ENT_HIDDEN: usize = 64;
@@ -159,6 +223,8 @@ impl<B: Backend> ActorCritic<B> {
         let (trunk, feat) = match cfg.trunk {
             TrunkKind::Nature => (Trunk::Nature(NatureTrunk::new(device)), 512),
             TrunkKind::Impala => (Trunk::Impala(ImpalaTrunk::new(cfg.width, device)), 256),
+            TrunkKind::Grid => (Trunk::Grid(GridTrunk::new(cfg.width, device)), 128),
+            TrunkKind::GridMlp => (Trunk::GridMlp(GridMlpTrunk::new(cfg.width, device)), 128),
         };
         let (ent_fc, fused) = if cfg.entities {
             (Some(LinearConfig::new(ENT_LEN, ENT_HIDDEN).init(device)), feat + ENT_HIDDEN)
@@ -168,12 +234,14 @@ impl<B: Backend> ActorCritic<B> {
         Self { trunk, ent_fc, actor: LinearConfig::new(fused, NUM_ACTIONS).init(device), critic: LinearConfig::new(fused, 1).init(device) }
     }
 
-    /// `obs` holds raw bytes `[batch, STACK, OBS_H, OBS_W]` scaled to 0..1 here; `ent` is `[batch, ENT_LEN]`.
+    /// `obs` holds raw bytes `[batch, C, H, W]` (see `obs::dims`) scaled to 0..1 here; `ent` is `[batch, ENT_LEN]`.
     pub fn forward(&self, obs: Tensor<B, 4>, ent: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 1>) {
         let x = obs / 255.0;
         let mut feat = match &self.trunk {
             Trunk::Nature(t) => t.forward(x),
             Trunk::Impala(t) => t.forward(x),
+            Trunk::Grid(t) => t.forward(x),
+            Trunk::GridMlp(t) => t.forward(x),
         };
         if let Some(fc) = &self.ent_fc {
             feat = Tensor::cat(vec![feat, relu(fc.forward(ent))], 1);
@@ -188,9 +256,10 @@ pub fn ent_tensor<B: Backend>(floats: &[f32], batch: usize, device: &B::Device) 
 }
 
 pub fn obs_tensor<B: Backend>(bytes: &[u8], batch: usize, device: &B::Device) -> Tensor<B, 4> {
-    debug_assert_eq!(bytes.len(), batch * OBS_LEN);
+    let (c, h, w) = obs::dims();
+    debug_assert_eq!(bytes.len(), batch * c * h * w);
     let floats: Vec<f32> = bytes.iter().map(|&b| b as f32).collect();
-    Tensor::from_data(TensorData::new(floats, [batch, STACK, OBS_H, OBS_W]), device)
+    Tensor::from_data(TensorData::new(floats, [batch, c, h, w]), device)
 }
 
 pub struct Hyper {
@@ -221,6 +290,12 @@ pub struct UpdateStats {
     pub value_loss: f32,
     pub entropy: f32,
     pub aug_loss: f32,
+    /// Mean of (ratio - 1 - log ratio): how far the update moved the policy.
+    pub approx_kl: f32,
+    /// Share of samples whose ratio left the clip range.
+    pub clip_frac: f32,
+    /// 1 - var(returns - value) / var(returns): 1 = the critic explains the returns.
+    pub explained_var: f32,
 }
 
 pub fn ppo_step<B: AutodiffBackend, O: Optimizer<ActorCritic<B>, B>>(
@@ -241,7 +316,16 @@ pub fn ppo_step<B: AutodiffBackend, O: Optimizer<ActorCritic<B>, B>>(
     let (logits, value) = model.forward(obs, ent.clone());
     let log_probs = log_softmax(logits.clone(), 1);
     let logp = log_probs.clone().gather(1, actions).squeeze_dim::<1>(1);
-    let ratio = (logp - old_logp).exp();
+    let log_ratio = logp - old_logp;
+    let ratio = log_ratio.clone().exp();
+    let approx_kl: f32 = (ratio.clone().detach() - 1.0 - log_ratio.detach()).mean().into_scalar().elem();
+    let clip_frac: f32 = ratio.clone().detach().sub_scalar(1.0).abs().greater_elem(hyper.clip).float().mean().into_scalar().elem();
+    let explained_var = {
+        let diff = returns.clone() - value.clone().detach();
+        let var = |t: Tensor<B, 1>| -> f32 { (t.clone().powf_scalar(2.0).mean() - t.mean().powf_scalar(2.0)).into_scalar().elem() };
+        let vr = var(returns.clone());
+        if vr > 1e-8 { 1.0 - var(diff) / vr } else { 0.0 }
+    };
     let surr1 = ratio.clone() * adv.clone();
     let surr2 = ratio.clamp(1.0 - hyper.clip, 1.0 + hyper.clip) * adv;
     let policy_loss = -surr1.min_pair(surr2).mean();
@@ -269,6 +353,9 @@ pub fn ppo_step<B: AutodiffBackend, O: Optimizer<ActorCritic<B>, B>>(
         value_loss: value_loss.into_scalar().elem(),
         entropy: entropy.into_scalar().elem(),
         aug_loss: aug_stat,
+        approx_kl,
+        clip_frac,
+        explained_var,
     };
     let grads = GradientsParams::from_grads(loss.backward(), &model);
     (optim.step(hyper.lr, model, grads), stats)
@@ -325,7 +412,8 @@ mod tests {
     fn run(cfg: NetConfig) -> ([usize; 2], [usize; 1]) {
         let device = Default::default();
         let model = ActorCritic::<T>::new(&cfg, &device);
-        let obs = Tensor::<T, 4>::zeros([3, STACK, OBS_H, OBS_W], &device);
+        let (c, h, w) = if cfg.trunk.obs_kind() == ObsKind::Grid { (GRID_C, GRID_H, GRID_W) } else { (STACK, crate::env::OBS_H, crate::env::OBS_W) };
+        let obs = Tensor::<T, 4>::zeros([3, c, h, w], &device);
         let ent = Tensor::<T, 2>::zeros([3, ENT_LEN], &device);
         let (logits, value) = model.forward(obs, ent);
         (logits.dims(), value.dims())
@@ -353,6 +441,20 @@ mod tests {
     }
 
     #[test]
+    fn grid_shapes() {
+        let (l, v) = run(NetConfig { trunk: TrunkKind::Grid, width: 1, entities: true });
+        assert_eq!(l, [3, NUM_ACTIONS]);
+        assert_eq!(v, [3]);
+    }
+
+    #[test]
+    fn grid_mlp_shapes() {
+        let (l, v) = run(NetConfig { trunk: TrunkKind::GridMlp, width: 1, entities: true });
+        assert_eq!(l, [3, NUM_ACTIONS]);
+        assert_eq!(v, [3]);
+    }
+
+    #[test]
     fn config_line_round_trip() {
         let cfg = NetConfig { trunk: TrunkKind::Impala, width: 2, entities: false };
         let back = NetConfig::from_line(&cfg.to_line()).unwrap();
@@ -369,7 +471,7 @@ mod tests {
         let model = ActorCritic::<A>::new(&cfg, &device);
         let mut optim = AdamConfig::new().init();
         let n = 4;
-        let obs = vec![7u8; n * OBS_LEN];
+        let obs = vec![7u8; n * crate::env::OBS_LEN];
         let ent = vec![0.0f32; n * ENT_LEN];
         let batch = Batch {
             obs: &obs,

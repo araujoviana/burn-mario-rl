@@ -13,3 +13,4 @@ roms/
 checkpoints/
 *.pdf
 levels/
+/target_ext

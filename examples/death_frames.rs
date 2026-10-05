@@ -15,7 +15,9 @@ fn cfg<T: std::str::FromStr>(name: &str, default: T) -> T {
 fn main() -> Result<(), String> {
     let device = Default::default();
     let ckpt: String = cfg("CKPT", "checkpoints/best".to_string());
-    let model = ActorCritic::<Inner>::new(&NetConfig::for_checkpoint(&ckpt), &device)
+    let net_cfg = NetConfig::for_checkpoint(&ckpt);
+    burn_mario_rl::obs::set(net_cfg.trunk.obs_kind());
+    let model = ActorCritic::<Inner>::new(&net_cfg, &device)
         .load_file(ckpt, &CompactRecorder::new(), &device)
         .map_err(|e| e.to_string())?;
     let state = std::fs::read("level1.state").map_err(|e| e.to_string())?;

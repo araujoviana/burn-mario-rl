@@ -12,3 +12,5 @@ flex = ["burn/flex"]
 tch = ["burn/tch"]
 cuda = ["burn/cuda", "burn/fusion", "burn/autotune"]
 wgpu = ["burn/wgpu"]
+# 11 actions instead of 7: adds down (pipes), up (vines, doors) and spin jump. Checkpoints are not interchangeable.
+extended_actions = []

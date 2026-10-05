@@ -10,13 +10,15 @@ use burn::tensor::Tensor;
 use burn_mario_rl::augment::random_shift;
 use burn_mario_rl::backend::{Inner, Train};
 use burn_mario_rl::entities::ENT_LEN;
-use burn_mario_rl::env::{OBS_LEN, Outcome};
+use burn_mario_rl::env::Outcome;
+use burn_mario_rl::obs;
 use burn_mario_rl::levels::LevelSet;
 use burn_mario_rl::plr::{LevelSampler, PlrConfig, level_scores};
 use burn_mario_rl::ppo::{ActorCritic, Batch, Hyper, NUM_ACTIONS, NetConfig, ent_tensor, gae, obs_tensor, ppo_step, sample_action};
 use burn_mario_rl::rng::next_u64;
 use burn_mario_rl::vec_env::{EpisodeInfo, VecEnv};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -26,6 +28,13 @@ type B = Train;
 
 fn cfg<T: FromStr>(name: &str, default: T) -> T {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Writes `<dir>/<name>.mpk` through a temp file so a crash mid-save never leaves a truncated checkpoint.
+fn save_atomic(model: &ActorCritic<Train>, dir: &str, name: &str) -> Result<(), String> {
+    let tmp = format!("{dir}/{name}_tmp"); // no dot: save_file swaps any extension for .mpk
+    model.clone().save_file(tmp.clone(), &CompactRecorder::new()).map_err(|e| e.to_string())?;
+    std::fs::rename(format!("{tmp}.mpk"), format!("{dir}/{name}.mpk")).map_err(|e| e.to_string())
 }
 
 fn to_vec<const D: usize>(t: Tensor<Inner, D>) -> Vec<f32> {
@@ -66,8 +75,8 @@ fn main() -> Result<(), String> {
     let rom = PathBuf::from(cfg("ROM", "Super Mario World (USA).sfc".to_string()));
 
     let levels = Arc::new(LevelSet::load(Path::new(&cfg("LEVELS", "levels".to_string())))?);
-    // EXCLUDE=8,12 drops levels from training (they stay out of the held-out set too).
-    let excluded: Vec<usize> = cfg("EXCLUDE", String::new()).split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    // EXCLUDE drops levels from training (default 8,12,15,17: lava cave, two switch palaces, a stub; they stay out of the held-out set too).
+    let excluded: Vec<usize> = cfg("EXCLUDE", "8,12,15,17".to_string()).split(',').filter_map(|v| v.trim().parse().ok()).collect();
     let train_ids: Vec<usize> = levels.train_ids().into_iter().filter(|id| !excluded.contains(id)).collect();
     let held_ids = levels.held_out_ids();
     println!("levels: {} train, {} held out", train_ids.len(), held_ids.len());
@@ -75,7 +84,9 @@ fn main() -> Result<(), String> {
     let sampler = LevelSampler::shared(train_ids.clone(), plr_cfg);
     let k_speed: f32 = cfg("SPEED_K", 1.0);
     let net_cfg = NetConfig::from_env();
-    let aug_pad: usize = cfg("AUG_PAD", 4);
+    obs::set(net_cfg.trunk.obs_kind());
+    let obs_len = obs::len();
+    let aug_pad: usize = if net_cfg.trunk.obs_kind() == obs::ObsKind::Grid { 0 } else { cfg("AUG_PAD", 4) }; // random shift is for pixels
     let aug_coef: f32 = if aug_pad > 0 { cfg("AUG_COEF", 0.1) } else { 0.0 };
     println!("net {} | plr {} | speed k {k_speed} | aug pad {aug_pad} coef {aug_coef}", net_cfg.to_line(), plr_cfg.enabled);
 
@@ -97,8 +108,19 @@ fn main() -> Result<(), String> {
     }
     std::fs::create_dir_all(&ckpt_dir).map_err(|e| e.to_string())?;
     std::fs::write(format!("{ckpt_dir}/net.cfg"), net_cfg.to_line()).map_err(|e| e.to_string())?;
+    // Telemetry for offline analysis: one line per finished episode and one per iteration (see scripts/analyze.py).
+    let open_log = |name: &str| std::fs::OpenOptions::new().create(true).append(true).open(format!("{ckpt_dir}/{name}")).map_err(|e| e.to_string());
+    let mut episode_log = std::io::BufWriter::new(open_log("episodes.jsonl")?);
+    let mut iter_log = std::io::BufWriter::new(open_log("telemetry.jsonl")?);
 
-    let mut envs = VecEnv::new(n, &core, &rom, levels.clone(), sampler.clone(), k_speed, seed)?;
+    // FRONTIER=<p>: a share p of episodes start from the furthest points reached so far (0 = off).
+    let frontier: f32 = cfg("FRONTIER", 0.0);
+    // EXPLORE_BONUS: reward for discovering a new (x, y) cell of a level (default 1.0).
+    let explore_bonus: f32 = cfg("EXPLORE_BONUS", 1.0);
+    // PATH_SHARE: share of episodes that start along a recorded winning path, nearest the finish first (default 0.25).
+    let path_share: f32 = cfg("PATH_SHARE", 0.25);
+    let archive = (frontier > 0.0).then(|| burn_mario_rl::archive::Frontier { archive: burn_mario_rl::archive::Archive::shared(levels.levels.len()), start_share: frontier, bonus: explore_bonus, path_share });
+    let mut envs = VecEnv::with_archive(n, &core, &rom, levels.clone(), sampler.clone(), archive.clone(), k_speed, seed)?;
     println!("{n} envs up, rollout {rollout}, {} steps per iteration, {} updates per iteration, lr {}, gamma {gamma}, lambda {lambda}", n * rollout, hyper.epochs * hyper.minibatches, hyper.lr);
 
     let eval_every: u32 = cfg("EVAL_EVERY", 20);
@@ -111,7 +133,7 @@ fn main() -> Result<(), String> {
     };
 
     let batch_size = n * rollout;
-    let mut obs_buf = vec![0u8; batch_size * OBS_LEN];
+    let mut obs_buf = vec![0u8; batch_size * obs_len];
     let mut ent_buf = vec![0f32; batch_size * ENT_LEN];
     let mut level_buf = vec![0usize; batch_size];
     let mut actions = vec![0i64; batch_size];
@@ -122,14 +144,16 @@ fn main() -> Result<(), String> {
 
     let mut recent: VecDeque<EpisodeInfo> = VecDeque::new();
     let mut per_level: HashMap<usize, VecDeque<EpisodeInfo>> = HashMap::new();
+    let mut frontier_level: HashMap<usize, VecDeque<EpisodeInfo>> = HashMap::new();
     let (mut steps_done, mut iter, mut best_rate, mut best_ret, start) = (0u64, 0u32, -1.0f32, f32::MIN, Instant::now());
 
     while steps_done < total_steps {
         let iter_start = Instant::now();
+        let mut act_hist = [0u32; NUM_ACTIONS];
         let inference = model.valid();
         for t in 0..rollout {
             let range = t * n..(t + 1) * n;
-            obs_buf[t * n * OBS_LEN..(t + 1) * n * OBS_LEN].copy_from_slice(&envs.obs);
+            obs_buf[t * n * obs_len..(t + 1) * n * obs_len].copy_from_slice(&envs.obs);
             ent_buf[t * n * ENT_LEN..(t + 1) * n * ENT_LEN].copy_from_slice(&envs.ent);
             let (logits, value) = inference.forward(obs_tensor::<Inner>(&envs.obs, n, &device), ent_tensor::<Inner>(&envs.ent, n, &device));
             let (logits, value) = (to_vec(logits), to_vec(value));
@@ -137,6 +161,7 @@ fn main() -> Result<(), String> {
             for e in 0..n {
                 let (a, lp) = sample_action(&logits[e * NUM_ACTIONS..(e + 1) * NUM_ACTIONS], &mut rng);
                 actions[t * n + e] = a as i64;
+                act_hist[a] += 1;
                 logps[t * n + e] = lp;
                 chosen.push(a);
             }
@@ -148,6 +173,41 @@ fn main() -> Result<(), String> {
             dones[range.clone()].copy_from_slice(&step.dones);
             level_buf[range].copy_from_slice(&step.step_levels);
             for info in step.finished {
+                let t = &info.tele;
+                let acts: Vec<String> = info.actions.iter().map(|a| a.to_string()).collect();
+                let _ = writeln!(
+                    episode_log,
+                    r#"{{"iter":{},"step":{},"level":{},"fs":{},"start_x":{},"out":"{}","steps":{},"max_x":{},"ret":{:.2},"r_prog":{:.2},"r_coin":{:.2},"r_time":{:.2},"r_death":{:.1},"r_timeout":{:.1},"r_clear":{:.1},"r_explore":{:.1},"end_x":{},"end_y":{},"cause":"{}","acts":[{}]}}"#,
+                    iter + 1,
+                    steps_done,
+                    levels.levels[info.level].id,
+                    info.from_start,
+                    info.start_x,
+                    match info.outcome { Outcome::Cleared => "clear", Outcome::Died => "died", Outcome::Timeout => "timeout", Outcome::Running => "running" },
+                    info.steps,
+                    info.max_x,
+                    info.ret,
+                    t.r_progress,
+                    t.r_coin,
+                    t.r_time,
+                    t.r_death,
+                    t.r_timeout,
+                    t.r_clear,
+                    t.r_explore,
+                    t.end_x,
+                    t.end_y,
+                    t.cause.name(),
+                    acts.join(","),
+                );
+                if !info.from_start {
+                    // frontier restarts train the policy but do not count toward the clear rates
+                    let q = frontier_level.entry(info.level).or_default();
+                    q.push_back(info);
+                    if q.len() > 50 {
+                        q.pop_front();
+                    }
+                    continue;
+                }
                 recent.push_back(info);
                 if recent.len() > 100 {
                     recent.pop_front();
@@ -178,15 +238,16 @@ fn main() -> Result<(), String> {
         let mb = batch_size / hyper.minibatches;
         let mut order: Vec<usize> = (0..batch_size).collect();
         let mut last = None;
+        let (mut sum_kl, mut sum_clip, mut sum_ev, mut updates) = (0.0f32, 0.0f32, 0.0f32, 0u32);
         for _ in 0..hyper.epochs {
             for i in (1..order.len()).rev() {
                 order.swap(i, (next_u64(&mut rng) % (i as u64 + 1)) as usize);
             }
             for chunk in order.chunks(mb) {
-                let mut obs = Vec::with_capacity(chunk.len() * OBS_LEN);
+                let mut obs = Vec::with_capacity(chunk.len() * obs_len);
                 let mut ent = Vec::with_capacity(chunk.len() * ENT_LEN);
                 for &i in chunk {
-                    obs.extend_from_slice(&obs_buf[i * OBS_LEN..(i + 1) * OBS_LEN]);
+                    obs.extend_from_slice(&obs_buf[i * obs_len..(i + 1) * obs_len]);
                     ent.extend_from_slice(&ent_buf[i * ENT_LEN..(i + 1) * ENT_LEN]);
                 }
                 let mut aug = vec![0u8; if aug_pad > 0 { obs.len() } else { 0 }];
@@ -210,6 +271,10 @@ fn main() -> Result<(), String> {
                 };
                 let (m, stats) = ppo_step(model, &mut optim, &hyper, &batch, &device);
                 model = m;
+                sum_kl += stats.approx_kl;
+                sum_clip += stats.clip_frac;
+                sum_ev += stats.explained_var;
+                updates += 1;
                 last = Some(stats);
             }
         }
@@ -234,6 +299,29 @@ fn main() -> Result<(), String> {
             stats.entropy,
             stats.aug_loss,
         );
+        {
+            let u = updates.max(1) as f32;
+            let adv_mean = adv.iter().sum::<f32>() / adv.len() as f32;
+            let adv_std = (adv.iter().map(|a| (a - adv_mean).powi(2)).sum::<f32>() / adv.len() as f32).sqrt();
+            let val_mean = values.iter().sum::<f32>() / values.len() as f32;
+            let ret_mean = returns.iter().sum::<f32>() / returns.len() as f32;
+            let hist: Vec<String> = act_hist.iter().map(|a| a.to_string()).collect();
+            let _ = writeln!(
+                iter_log,
+                r#"{{"iter":{iter},"steps":{steps_done},"sps":{:.0},"rollout_s":{rollout_secs:.2},"total_s":{:.2},"pl":{:.4},"vl":{:.4},"ent":{:.4},"kl":{:.5},"clip_frac":{:.4},"explained_var":{:.4},"adv_mean":{adv_mean:.4},"adv_std":{adv_std:.4},"value_mean":{val_mean:.3},"return_mean":{ret_mean:.3},"acts":[{}]}}"#,
+                batch_size as f32 / iter_start.elapsed().as_secs_f32(),
+                iter_start.elapsed().as_secs_f32(),
+                stats.policy_loss,
+                stats.value_loss,
+                stats.entropy,
+                sum_kl / u,
+                sum_clip / u,
+                sum_ev / u,
+                hist.join(","),
+            );
+            let _ = episode_log.flush();
+            let _ = iter_log.flush();
+        }
         if iter % 10 == 0 {
             let mut line = String::from("  per-level clear%:");
             for &l in &train_ids {
@@ -242,6 +330,15 @@ fn main() -> Result<(), String> {
                 }
             }
             println!("{line}");
+            if let Some(fr) = &archive {
+                let counts = fr.archive.lock().expect("archive").counts();
+                let shown: Vec<String> = train_ids.iter().map(|&l| format!("L{}:{}", levels.levels[l].id, counts[l])).collect();
+                println!("  frontier states: {}", shown.join(" "));
+                let paths: Vec<String> = fr.archive.lock().expect("archive").path_status().iter().map(|(l, steps, frac)| format!("L{}:{}steps/back{:.0}%", levels.levels[*l].id, steps, frac * 100.0)).collect();
+                println!("  win paths: {}", if paths.is_empty() { "none yet".to_string() } else { paths.join(" ") });
+                let rates: Vec<String> = train_ids.iter().filter_map(|l| frontier_level.get(l).map(|q| format!("L{}:{:.0}", levels.levels[*l].id, clear_rate(q) * 100.0))).collect();
+                println!("  frontier-start clear%: {}", rates.join(" "));
+            }
             let weights = sampler.lock().expect("sampler").weights();
             let mut top: Vec<_> = weights.iter().map(|&(l, w)| (levels.levels[l].id, w)).collect();
             top.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -260,13 +357,13 @@ fn main() -> Result<(), String> {
         }
         if recent.len() >= 20 && (rate > best_rate || (rate == best_rate && mean_ret > best_ret)) {
             (best_rate, best_ret) = (rate, mean_ret);
-            model.clone().save_file(format!("{ckpt_dir}/best"), &CompactRecorder::new()).map_err(|e| e.to_string())?;
+            save_atomic(&model, &ckpt_dir, "best")?;
         }
         if iter % 10 == 0 {
-            model.clone().save_file(format!("{ckpt_dir}/latest"), &CompactRecorder::new()).map_err(|e| e.to_string())?;
+            save_atomic(&model, &ckpt_dir, "latest")?;
         }
     }
-    model.save_file(format!("{ckpt_dir}/latest"), &CompactRecorder::new()).map_err(|e| e.to_string())?;
+    save_atomic(&model, &ckpt_dir, "latest")?;
     println!("done: {steps_done} steps in {:.0}s", start.elapsed().as_secs_f32());
     // Dropping two VecEnvs (train + eval) corrupts the heap while the cores unload; everything is saved,
     // so leave without running destructors.

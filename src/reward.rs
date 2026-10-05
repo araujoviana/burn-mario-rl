@@ -1,6 +1,6 @@
 //! Reward terms that do not need the emulator, so they can be tested directly.
 
-use crate::env::FRAME_SKIP;
+use crate::env::frame_skip;
 use crate::ram::TIMER_TICK_FRAMES;
 
 pub const REWARD_CLEAR: f32 = 100.0;
@@ -14,7 +14,7 @@ pub fn clear_bonus(timer_left: u32, timer_start: u32, k: f32) -> f32 {
 
 /// Agent steps until the in-game timer would reach zero, with a floor for short timers.
 pub fn step_cap(timer_start: u32) -> u32 {
-    (timer_start * TIMER_TICK_FRAMES / FRAME_SKIP).max(MIN_STEP_CAP)
+    (timer_start * TIMER_TICK_FRAMES / frame_skip()).max(MIN_STEP_CAP)
 }
 
 #[cfg(test)]
@@ -38,7 +38,7 @@ mod tests {
     fn cap_follows_timer() {
         // timer ticks every TIMER_TICK_FRAMES frames; one agent step is FRAME_SKIP frames.
         let cap = step_cap(300);
-        assert_eq!(cap, 300 * crate::ram::TIMER_TICK_FRAMES / crate::env::FRAME_SKIP);
+        assert_eq!(cap, 300 * crate::ram::TIMER_TICK_FRAMES / crate::env::frame_skip());
         assert!(step_cap(0) >= 600, "never below the floor");
     }
 }

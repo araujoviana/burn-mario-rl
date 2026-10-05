@@ -1,9 +1,12 @@
+pub mod archive;
 pub mod backend;
 pub mod augment;
 pub mod emulator;
 pub mod entities;
 pub mod levels;
 pub mod env;
+pub mod grid;
+pub mod obs;
 pub mod plr;
 pub mod ppo;
 pub mod ram;

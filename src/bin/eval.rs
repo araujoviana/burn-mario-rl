@@ -55,7 +55,9 @@ fn main() -> Result<(), String> {
     let mut best_x = 0u16;
     let device = Default::default();
     let ckpt: String = cfg("CKPT", "checkpoints/best".to_string());
-    let model = ActorCritic::<Inner>::new(&NetConfig::for_checkpoint(&ckpt), &device)
+    let net_cfg = NetConfig::for_checkpoint(&ckpt);
+    burn_mario_rl::obs::set(net_cfg.trunk.obs_kind());
+    let model = ActorCritic::<Inner>::new(&net_cfg, &device)
         .load_file(ckpt, &CompactRecorder::new(), &device)
         .map_err(|e| format!("load checkpoint: {e}"))?;
 

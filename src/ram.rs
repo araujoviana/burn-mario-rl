@@ -11,6 +11,11 @@ pub const PLAYER_Y: usize = 0x96; // 16 bit
 pub const PLAYER_SPEED_X: usize = 0x7B; // signed
 pub const PLAYER_SPEED_Y: usize = 0x7D; // signed
 pub const PLAYER_BLOCKED: usize = 0x77; // bit 2 set = standing on something
+pub const COINS: usize = 0xDBF; // coin counter 0..=99 (checked with examples/coin_probe.rs)
+pub const BLUE_SWITCH_TIMER: usize = 0x14AD; // frames left of a blue P-switch
+pub const SILVER_SWITCH_TIMER: usize = 0x14AE;
+pub const ONOFF_SWITCH: usize = 0x14AF; // 0 = on, 1 = off
+pub const SWIMMING: usize = 0x75; // non-zero in water
 pub const POWERUP: usize = 0x19;
 pub const TRANSLEVEL: usize = 0x13BF;
 pub const MAP_X: usize = 0x1F17; // overworld cursor, 16 bit, pixels

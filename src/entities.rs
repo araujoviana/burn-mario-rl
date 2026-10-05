@@ -2,7 +2,7 @@
 
 use crate::ram::*;
 
-pub const ENT_LEN: usize = SPRITE_SLOTS * 5 + 6;
+pub const ENT_LEN: usize = SPRITE_SLOTS * 5 + 10;
 const CAMERA_X: usize = 0x1A;
 const CAMERA_Y: usize = 0x1C;
 
@@ -35,6 +35,11 @@ pub fn entity_vector(ram: &[u8], out: &mut [f32]) {
     m[3] = ram[POWERUP] as f32 / 3.0;
     m[4] = clamp_unit(mx - u16_at(ram, CAMERA_X) as i32, 256.0);
     m[5] = clamp_unit(my - u16_at(ram, CAMERA_Y) as i32, 256.0);
+    // switch timers and water: what a blue P-switch run or an on/off block room depends on
+    m[6] = ram[BLUE_SWITCH_TIMER] as f32 / 255.0;
+    m[7] = ram[SILVER_SWITCH_TIMER] as f32 / 255.0;
+    m[8] = (ram[ONOFF_SWITCH] & 1) as f32;
+    m[9] = (ram[SWIMMING] != 0) as u8 as f32;
 }
 
 #[cfg(test)]

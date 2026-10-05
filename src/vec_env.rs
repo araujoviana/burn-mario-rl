@@ -2,8 +2,10 @@
 //! because the core keeps global state, so a shared handle would be one emulator.
 //! Workers pick the level of each new episode from a shared `LevelSampler`.
 
+use crate::archive::Frontier;
 use crate::entities::ENT_LEN;
-use crate::env::{MarioEnv, OBS_LEN, Outcome, StepResult};
+use crate::env::{ACTIONS, EpisodeTelemetry, MarioEnv, Outcome, StepResult};
+use crate::obs;
 use crate::levels::LevelSet;
 use crate::plr::SharedSampler;
 use std::path::Path;
@@ -19,6 +21,13 @@ pub struct EpisodeInfo {
     pub max_x: u16,
     /// Index into the level set the episode ran on.
     pub level: usize,
+    /// False when the episode began at an archived frontier state instead of the level start.
+    pub from_start: bool,
+    /// x Mario started the episode at (above the level start only for frontier episodes).
+    pub start_x: u16,
+    pub tele: EpisodeTelemetry,
+    /// How often each action was chosen during the episode.
+    pub actions: [u16; ACTIONS.len()],
 }
 
 struct Reply {
@@ -38,7 +47,7 @@ pub struct VecEnv {
     commands: Vec<Sender<usize>>,
     replies: Receiver<Reply>,
     workers: Vec<JoinHandle<()>>,
-    /// Latest observation of every env, `n * OBS_LEN` bytes.
+    /// Latest observation of every env, `n * obs::len()` bytes.
     pub obs: Vec<u8>,
     /// Latest entity vector of every env, `n * ENT_LEN` floats.
     pub ent: Vec<f32>,
@@ -55,8 +64,41 @@ pub struct StepBatch {
     pub finished: Vec<EpisodeInfo>,
 }
 
+/// Replays `trace` from the start of `level`; when it clears again, stores a state every `PATH_STRIDE` steps
+/// as the level's winning path and writes the action list to `$CKPT_DIR/wins/`.
+fn record_win(env: &mut MarioEnv, level: usize, trace: &[u8], fr: &Frontier) {
+    if env.reset_from(level, None).is_err() {
+        return;
+    }
+    let mut states = Vec::new();
+    let mut outcome = Outcome::Running;
+    for (i, &a) in trace.iter().enumerate() {
+        if i % crate::archive::PATH_STRIDE == 0 {
+            match env.snapshot() {
+                Ok(s) => states.push(s),
+                Err(_) => return,
+            }
+        }
+        outcome = env.step(a as usize).outcome;
+        if outcome != Outcome::Running {
+            break;
+        }
+    }
+    if outcome != Outcome::Cleared {
+        eprintln!("win replay on level index {level} did not clear again ({} steps): not deterministic, path dropped", trace.len());
+        return;
+    }
+    let dir = format!("{}/wins", std::env::var("CKPT_DIR").unwrap_or_else(|_| ".".into()));
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let list: Vec<String> = trace.iter().map(|a| a.to_string()).collect();
+        let _ = std::fs::write(format!("{dir}/level{level}_{}steps.actions", trace.len()), list.join(","));
+    }
+    eprintln!("win path recorded: level index {level}, {} steps, {} states", trace.len(), states.len());
+    fr.archive.lock().expect("archive").offer_path(level, trace.len() as u32, states);
+}
+
 #[allow(clippy::too_many_arguments)]
-fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, levels: Arc<LevelSet>, sampler: SharedSampler, k_speed: f32, seed: u64, commands: Receiver<usize>, replies: Sender<Reply>) {
+fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, levels: Arc<LevelSet>, sampler: SharedSampler, frontier: Option<Frontier>, k_speed: f32, seed: u64, commands: Receiver<usize>, replies: Sender<Reply>) {
     let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
     let mut env = match MarioEnv::with_levels(&core, &rom, levels, k_speed) {
         Ok(env) => env,
@@ -70,18 +112,66 @@ fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, levels: 
     let _ = env.reset_to(first);
     let _ = replies.send(Reply { id, obs: env.observation().to_vec(), ent: env.entities().to_vec(), reward: 0.0, done: false, info: None, level: env.level(), step_level: env.level() });
     let (mut ret, mut steps) = (0.0f32, 0u32);
+    let mut from_start = true;
+    let mut start_x = env.x();
+    let mut acts = [0u16; ACTIONS.len()];
+    let mut trace: Vec<u8> = Vec::new(); // actions of the current episode when it began at the level start
+    let mut from_path = false;
     while let Ok(action) = commands.recv() {
         let step_level = env.level();
-        let StepResult { reward, outcome } = env.step(action);
+        acts[action] = acts[action].saturating_add(1);
+        if from_start {
+            trace.push(action as u8);
+        }
+        let StepResult { mut reward, outcome } = env.step(action);
+        let done = outcome != Outcome::Running;
+        if let Some(fr) = &frontier {
+            // Save a state the first time anyone stands on solid ground in a new cell, and pay a bonus for it.
+            if !done && env.grounded() && fr.archive.lock().expect("archive").wants(step_level, env.x(), env.y()) {
+                if let Ok(state) = env.snapshot() {
+                    if fr.archive.lock().expect("archive").offer(step_level, env.x(), env.y(), state) {
+                        reward += fr.bonus;
+                        env.credit_exploration(fr.bonus);
+                    }
+                }
+            }
+        }
         ret += reward;
         steps += 1;
-        let done = outcome != Outcome::Running;
-        let info = done.then(|| EpisodeInfo { ret, steps, outcome, max_x: env.max_x(), level: step_level });
+        let info = done.then(|| EpisodeInfo { ret, steps, outcome, max_x: env.max_x(), level: step_level, from_start, start_x, tele: *env.telemetry(), actions: acts });
         if done {
+            if let Some(fr) = &frontier {
+                if from_path {
+                    fr.archive.lock().expect("archive").report_path(step_level, outcome == Outcome::Cleared);
+                }
+                // A faster win from the level start: replay it to check it is deterministic and keep a state every few steps.
+                if outcome == Outcome::Cleared && from_start && fr.path_share > 0.0 {
+                    let known = fr.archive.lock().expect("archive").best_path_steps(step_level);
+                    if known.is_none_or(|k| (trace.len() as u32) * 100 < k * 97) {
+                        record_win(&mut env, step_level, &trace, fr);
+                    }
+                }
+            }
+            trace.clear();
             let next = sampler.lock().expect("sampler").sample(&mut rng);
-            let _ = env.reset_to(next);
+            let mut restart = None;
+            from_path = false;
+            if let Some(fr) = &frontier {
+                let u = crate::rng::unit_f32(&mut rng);
+                if u < fr.path_share {
+                    restart = fr.archive.lock().expect("archive").sample_path(next, &mut rng);
+                    from_path = restart.is_some();
+                }
+                if restart.is_none() && u >= fr.path_share && u < fr.path_share + fr.start_share {
+                    restart = fr.archive.lock().expect("archive").sample(next, &mut rng);
+                }
+            }
+            from_start = restart.is_none();
+            let _ = env.reset_from(next, restart.as_ref().map(|(_, s)| s.as_slice()));
             ret = 0.0;
             steps = 0;
+            start_x = env.x();
+            acts = [0u16; ACTIONS.len()];
         }
         if replies.send(Reply { id, obs: env.observation().to_vec(), ent: env.entities().to_vec(), reward, done, info, level: env.level(), step_level }).is_err() {
             break;
@@ -91,6 +181,12 @@ fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, levels: 
 
 impl VecEnv {
     pub fn new(n: usize, core: &Path, rom: &Path, levels: Arc<LevelSet>, sampler: SharedSampler, k_speed: f32, seed: u64) -> Result<Self, String> {
+        Self::with_archive(n, core, rom, levels, sampler, None, k_speed, seed)
+    }
+
+    /// `frontier` = shared archive of discovered states, the share of episodes that start from one, and the discovery bonus.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_archive(n: usize, core: &Path, rom: &Path, levels: Arc<LevelSet>, sampler: SharedSampler, frontier: Option<Frontier>, k_speed: f32, seed: u64) -> Result<Self, String> {
         let (reply_tx, replies) = channel();
         let (mut commands, mut workers) = (Vec::new(), Vec::new());
         for id in 0..n {
@@ -98,17 +194,18 @@ impl VecEnv {
             std::fs::copy(core, &copy).map_err(|e| format!("copy core: {e}"))?;
             let (tx, rx) = channel();
             commands.push(tx);
-            let (rom, levels, sampler, reply_tx) = (rom.to_path_buf(), levels.clone(), sampler.clone(), reply_tx.clone());
+            let (rom, levels, sampler, frontier, reply_tx) = (rom.to_path_buf(), levels.clone(), sampler.clone(), frontier.clone(), reply_tx.clone());
             let worker_seed = seed.wrapping_add(id as u64 + 1);
-            workers.push(std::thread::spawn(move || worker(id, copy, rom, levels, sampler, k_speed, worker_seed, rx, reply_tx)));
+            workers.push(std::thread::spawn(move || worker(id, copy, rom, levels, sampler, frontier, k_speed, worker_seed, rx, reply_tx)));
         }
         drop(reply_tx);
-        let mut obs = vec![0u8; n * OBS_LEN];
+        let obs_len = obs::len();
+        let mut obs = vec![0u8; n * obs_len];
         let mut ent = vec![0.0f32; n * ENT_LEN];
         let mut level_of = vec![0usize; n];
         for _ in 0..n {
             let r = replies.recv().map_err(|_| "a worker failed to start".to_string())?;
-            obs[r.id * OBS_LEN..(r.id + 1) * OBS_LEN].copy_from_slice(&r.obs);
+            obs[r.id * obs_len..(r.id + 1) * obs_len].copy_from_slice(&r.obs);
             ent[r.id * ENT_LEN..(r.id + 1) * ENT_LEN].copy_from_slice(&r.ent);
             level_of[r.id] = r.level;
         }
@@ -120,9 +217,10 @@ impl VecEnv {
             tx.send(a).expect("worker died");
         }
         let mut batch = StepBatch { rewards: vec![0.0; self.n], dones: vec![false; self.n], step_levels: vec![0; self.n], finished: Vec::new() };
+        let obs_len = obs::len();
         for _ in 0..self.n {
             let r = self.replies.recv().expect("worker died");
-            self.obs[r.id * OBS_LEN..(r.id + 1) * OBS_LEN].copy_from_slice(&r.obs);
+            self.obs[r.id * obs_len..(r.id + 1) * obs_len].copy_from_slice(&r.obs);
             self.ent[r.id * ENT_LEN..(r.id + 1) * ENT_LEN].copy_from_slice(&r.ent);
             self.levels[r.id] = r.level;
             batch.rewards[r.id] = r.reward;
