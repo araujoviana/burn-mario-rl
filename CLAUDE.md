@@ -67,3 +67,13 @@ Probably unnecessary: reset from a save state handles death. If lives still matt
 - Rust edition 2024. `cargo check` and `cargo test` run locally before anything goes to Colab.
 - Test the `Env` against a fake environment so the training loop is verifiable without a ROM.
 - Commit small steps; the repo is new and has no commits yet.
+
+## Results so far (2026-10-05)
+
+- **Baseline** (Nature CNN, 1M steps, 4 epochs, 16 envs): clears 3 of 17 training levels (L7 = original level 1 at 23%, L17 20%, L12 13%) plus the trivial L15; 0/30 on every held-out level. Level ids are in `levels/manifest.txt`.
+- **Full model** (IMPALA + entities + PLR + augmentation) was aborted at ~450k steps: ~140 steps/s on the T4 (GPU saturated), and PLR put ~80% of the weight on one level at a time. Never compared. Revisit with a softer `PLR_TEMP`/`PLR_RHO` before trusting PLR.
+- **Long run** (Nature, warm start from the baseline, `ENVS=64 EPOCHS=2 PLR=0 EXCLUDE=8`, ~805 steps/s), stopped at 5.73M of a planned 30M steps: 20-episode local eval gives L7 60%, L12 70%, L17 100%, L15 100%; every other training level 0%. **No transfer:** held-out L9 and L14 clear 0/20 (the in-training held-out clears of ~5-15% were noise from 8-16 episodes per eval; use 30+ episodes per level, e.g. the `eval` binary per level).
+- The 0% levels fail by dying at the same x every time at a pit/gap (L1, L3) or a grinder section (L13): a jump-skill problem, not a missing mechanic. Needs more training.
+- Checkpoints, log, and clips: `runs/long_5M/` (checkpoint, `SUMMARY.md`), `runs/videos/` (long-run clips). Not committed.
+- Speed notes: IMPALA is ~5x Nature per update on the T4 even after dropping the residual blocks; with 64 envs the loop is update-bound (rollout 4.6 s, update 5.5 s per 8192 steps). Overlapping rollout and update would be the next throughput win. `EXCLUDE=<ids>` drops levels from the training pool.
+- Resume: `INIT=runs/long_5M/latest TRUNK=nature ENTITIES=0 AUG_PAD=0 PLR=0 EXCLUDE=8 ENVS=64 EPOCHS=2`, on a core matching `levels/`.
