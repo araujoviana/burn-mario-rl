@@ -276,6 +276,29 @@ impl MarioEnv {
         Ok(env)
     }
 
+    /// Replays raw joypad masks (one per emulator frame) from the start of `level`, keeping a snapshot every
+    /// `stride_frames` frames. Returns the snapshots when the run clears the level, `None` otherwise.
+    pub fn replay_masks(&mut self, level: usize, masks: &[u16], stride_frames: usize) -> Option<Vec<Vec<u8>>> {
+        self.reset_from(level, None).ok()?;
+        let mut states = Vec::new();
+        for (i, &m) in masks.iter().enumerate() {
+            if i % stride_frames == 0 {
+                states.push(self.emu.save_state().ok()?);
+            }
+            self.emu.set_buttons(m);
+            self.emu.run_frame();
+            if self.emu.ram()[RAM_END_LEVEL_TIMER] != 0 {
+                return Some(states);
+            }
+        }
+        None
+    }
+
+    /// Index in the level set of the level with this id.
+    pub fn level_index(&self, id: usize) -> Option<usize> {
+        self.levels.levels.iter().position(|l| l.id == id)
+    }
+
     /// Number of levels in the set.
     pub fn level_count(&self) -> usize {
         self.levels.levels.len()

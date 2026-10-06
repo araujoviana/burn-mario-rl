@@ -122,6 +122,31 @@ fn load_saved_wins(env: &mut MarioEnv, fr: &Frontier) {
     }
 }
 
+/// Human demonstrations recorded with `examples/play.rs`: `$DEMOS_DIR` (default `demos`), files named
+/// `level<id>_<frames>f.demo`. Each is replayed from the level start; a run that clears becomes the level's
+/// winning path (unless a shorter win is already stored).
+fn load_demos(env: &mut MarioEnv, fr: &Frontier) {
+    let dir = std::env::var("DEMOS_DIR").unwrap_or_else(|_| "demos".into());
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let stride = crate::archive::PATH_STRIDE * crate::env::frame_skip() as usize;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("level").and_then(|r| r.strip_suffix("f.demo")) else { continue };
+        let Some((id, _frames)) = rest.split_once('_') else { continue };
+        let Some(level) = id.parse::<usize>().ok().and_then(|id| env.level_index(id)) else { continue };
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        let masks: Vec<u16> = text.trim().split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        match env.replay_masks(level, &masks, stride) {
+            Some(states) => {
+                let steps = (masks.len() / crate::env::frame_skip() as usize) as u32;
+                eprintln!("demo path loaded: {name}, {} frames, {} states", masks.len(), states.len());
+                fr.archive.lock().expect("archive").offer_path(level, steps, states);
+            }
+            None => eprintln!("demo {name} did not clear when replayed (different core build?), skipped"),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, levels: Arc<LevelSet>, sampler: SharedSampler, frontier: Option<Frontier>, k_speed: f32, seed: u64, commands: Receiver<usize>, replies: Sender<Reply>) {
     let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
@@ -136,6 +161,7 @@ fn worker(id: usize, core: std::path::PathBuf, rom: std::path::PathBuf, levels: 
     if id == 0 {
         if let Some(fr) = &frontier {
             load_saved_wins(&mut env, fr);
+            load_demos(&mut env, fr);
         }
     }
     let first = sampler.lock().expect("sampler").sample(&mut rng);

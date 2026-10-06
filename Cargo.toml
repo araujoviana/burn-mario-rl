@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff", "flex"] }
 libloading = "0.9.0"
+minifb = { version = "0.28", optional = true }
 
 [features]
 flex = ["burn/flex"]
@@ -14,3 +15,9 @@ cuda = ["burn/cuda", "burn/fusion", "burn/autotune"]
 wgpu = ["burn/wgpu"]
 # 11 actions instead of 7: adds down (pipes), up (vines, doors) and spin jump. Checkpoints are not interchangeable.
 extended_actions = []
+# Window and keyboard for examples/play.rs (recording human demonstrations).
+play = ["dep:minifb"]
+
+[[example]]
+name = "play"
+required-features = ["play"]
