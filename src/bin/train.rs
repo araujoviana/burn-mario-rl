@@ -1,6 +1,13 @@
-//! PPO training on a level set with PLR, entity inputs and DrAC augmentation.
-//! Env vars: ENVS, ROLLOUT, TOTAL_STEPS, LR, CORE, ROM, SEED, INIT, CKPT_DIR, LEVELS, EXCLUDE, PLR, PLR_TEMP, PLR_RHO,
-//! PLR_EMA, SPEED_K, AUG_PAD, AUG_COEF, EVAL_EVERY, EVAL_ENVS, EVAL_STEPS, TRUNK, WIDTH, ENTITIES.
+//! PPO training on a pool of levels.
+//!
+//! Env vars (defaults in parentheses):
+//! - run: `ENVS` (10), `ROLLOUT` (128), `TOTAL_STEPS` (2M), `EPOCHS` (4), `MINIBATCHES` (4), `LR`, `GAMMA`, `LAMBDA`,
+//!   `ENTROPY`, `REWARD_SCALE`, `SEED`, `INIT` (checkpoint to resume from), `CKPT_DIR`, `CORE`, `ROM`, `LEVELS`.
+//! - levels: `EXCLUDE` (8,12,15,17), `PLR` and `PLR_TEMP`/`PLR_RHO`/`PLR_EMA` (level sampler), `EVAL_EVERY`.
+//! - network: `TRUNK` (nature, impala, grid, gridmlp), `WIDTH`, `ENTITIES`, `AUG_PAD`/`AUG_COEF` (pixel models only).
+//! - environment: `FRAME_SKIP`, `TIMEOUT_PENALTY`, `COIN_K`, `SPEED_K`.
+//! - start states: `FRONTIER` (share of episodes started from archived states), `EXPLORE_BONUS`, `PATH_SHARE`
+//!   (share started along a winning run), `WINS_DIR` (saved winning runs), `DEMOS_DIR` (human demonstrations).
 
 use burn::module::{AutodiffModule, Module};
 use burn::optim::AdamConfig;
