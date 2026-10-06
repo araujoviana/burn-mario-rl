@@ -108,3 +108,7 @@ Probably unnecessary: reset from a save state handles death. If lives still matt
 - **Evaluate** a checkpoint with the same frame skip: `FRAME_SKIP=8 CKPT=<path without .mpk> LEVEL=<id> EPISODES=40 OUT=clip.mp4 eval`.
 - **VM:** `mario-vm` was stopped (not deleted) at this point; the disk keeps `/root/proj`, `/root/target_new` (7 actions, CUDA) and `/root/target_ext` (11 actions). Start it again from the Huawei console or the API (`batch_start_servers`, region `la-south-2`, server id in the memory notes); ssh works with the saved key once it is up.
 - **Next steps:** (1) resume ext8 and see whether L3, L13, L18 (pit deaths at the same x) get a first win; (2) held-out progress metric in the log (clears alone hide movement); (3) human demonstrations of the stuck levels, `docs/ideas/2026-10-05-human-demonstrations.md`; (4) possibly a recurrent policy for waiting and platform timing.
+
+### Stop rule (user decision, 2026-10-06)
+
+Done when every in-scope level clears >= 60% of 40 attempts from the level start. In scope: L0, L1, L2, L3, L5, L6, L7, L10, L11, L16, L20. L13 and L18 (waiting/timing levels) are dropped: train with `EXCLUDE=8,12,13,15,17,18`. Held-out L4, L9, L14, L19 are reported as transfer, not required. Demos recorded: `demos/level3_3002f.demo`, `demos/level20_4013f.demo` (both verified with `examples/demo_check.rs`).
