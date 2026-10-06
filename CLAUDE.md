@@ -112,3 +112,5 @@ Probably unnecessary: reset from a save state handles death. If lives still matt
 ### Stop rule (user decision, 2026-10-06)
 
 Done when every in-scope level clears >= 60% of 40 attempts from the level start. In scope: L0, L1, L2, L3, L5, L6, L7, L10, L11, L16, L20. L13 and L18 (waiting/timing levels) are dropped: train with `EXCLUDE=8,12,13,15,17,18`. Held-out L4, L9, L14, L19 are reported as transfer, not required. Demos recorded: `demos/level3_3002f.demo`, `demos/level20_4013f.demo` (both verified with `examples/demo_check.rs`).
+
+Update 2026-10-06: user also dropped L1 (likely a dev/test level), L5 and L11 (too hard to demo). In scope now: L0, L2, L3, L6, L7, L10, L16, L20. Train with `EXCLUDE=1,5,8,11,12,13,15,17,18`.
