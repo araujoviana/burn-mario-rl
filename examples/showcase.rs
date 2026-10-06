@@ -1,6 +1,7 @@
 //! Records the first cleared attempt of a checkpoint on one level for `scripts/showcase.py`: every emulator
 //! frame (raw RGB), and per agent step the tile grid the network saw, its action probabilities and the critic's
-//! value. Env: CKPT, LEVEL, EPISODES, OUT (directory), SEED, CORE, FRAME_SKIP.
+//! value. Env: CKPT, LEVEL, LEVELS (dir), EPISODES, OUT (directory), SEED, CORE, FRAME_SKIP, ANY (1 = if nothing clears,
+//! keep the attempt that got furthest).
 use burn::module::Module;
 use burn::record::CompactRecorder;
 use burn_mario_rl::backend::Inner;
@@ -34,13 +35,15 @@ fn main() -> Result<(), String> {
     burn_mario_rl::obs::set(net_cfg.trunk.obs_kind());
     let model = ActorCritic::<Inner>::new(&net_cfg, &device).load_file(ckpt, &CompactRecorder::new(), &device).map_err(|e| e.to_string())?;
     let core = PathBuf::from(cfg("CORE", "/usr/lib/libretro/snes9x_libretro.so".to_string()));
-    let levels = Arc::new(LevelSet::load(Path::new("levels"))?);
+    let levels = Arc::new(LevelSet::load(Path::new(&cfg("LEVELS", "levels".to_string())))?);
     let level_id: usize = cfg("LEVEL", 7);
     let level = levels.levels.iter().position(|l| l.id == level_id).ok_or("no such level")?;
     let mut env = MarioEnv::with_levels(&core, &PathBuf::from("Super Mario World (USA).sfc"), levels, 1.0)?;
     let out_dir: String = cfg("OUT", "runs/showcase/L7".to_string());
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let mut rng: u64 = cfg("SEED", 4242);
+    let any = cfg::<u8>("ANY", 0) == 1;
+    let mut best: Option<(u16, Vec<u8>, String, usize)> = None;
     for ep in 0..cfg("EPISODES", 30u32) {
         env.reset_to(level)?;
         let mut frames: Vec<u8> = Vec::new();
@@ -69,13 +72,21 @@ fn main() -> Result<(), String> {
                 break r.outcome;
             }
         };
-        println!("episode {ep}: {outcome:?} in {t} steps");
-        if outcome == Outcome::Cleared {
+        println!("episode {ep}: {outcome:?} in {t} steps, max_x {}", env.max_x());
+        if any && outcome != Outcome::Cleared && best.as_ref().is_none_or(|b| env.max_x() > b.0) {
+            best = Some((env.max_x(), frames, steps, nframes));
+        } else if outcome == Outcome::Cleared {
             std::fs::File::create(format!("{out_dir}/frames.rgb")).and_then(|mut f| f.write_all(&frames)).map_err(|e| e.to_string())?;
             std::fs::write(format!("{out_dir}/steps.jsonl"), steps).map_err(|e| e.to_string())?;
             println!("saved {out_dir} ({nframes} frames)");
             std::process::exit(0);
         }
+    }
+    if let Some((x, frames, steps, nframes)) = best {
+        std::fs::File::create(format!("{out_dir}/frames.rgb")).and_then(|mut f| f.write_all(&frames)).map_err(|e| e.to_string())?;
+        std::fs::write(format!("{out_dir}/steps.jsonl"), steps).map_err(|e| e.to_string())?;
+        println!("no clear; saved the furthest attempt (x {x}, {nframes} frames) to {out_dir}");
+        std::process::exit(0);
     }
     println!("no clear");
     std::process::exit(1);

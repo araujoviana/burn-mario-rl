@@ -66,7 +66,7 @@ fn main() -> Result<(), String> {
                 }
             }
             emu.set_buttons(0);
-            if best < MIN_PROGRESS_X {
+            if best < std::env::var("MIN_PROGRESS").ok().and_then(|v| v.parse().ok()).unwrap_or(MIN_PROGRESS_X) {
                 println!("({x:3},{y:3}) tl {tl:#04x}: skip (random policy reached only x={best})");
                 continue;
             }

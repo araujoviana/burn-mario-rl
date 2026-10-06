@@ -56,12 +56,12 @@ def draw_pad(d, mask, x0, y0):
         text(d, (bx, by), name, BOLD, (20, 20, 30) if mask & bit else DIM, "mm")
 
 
-def base(stage, of, note):
+def base(stage, of, note, label=""):
     px_note = 48
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
     text(d, (48, 26), "Reinforcement learning no Super Mario World", BOLD, TXT)
-    text(d, (860, 34), f"fase {stage} de {of}", REG, ACC)
+    text(d, (860, 34), label or f"fase {stage} de {of}", REG, ACC)
     d.rounded_rectangle([PX - 20, 84, W - 28, 976], 14, fill=PANEL)
     text(d, (PX, 108), "O QUE A IA VÊ", HEAD, ACC)
     text(d, (PX, 480), "O QUE ELA PENSA", HEAD, ACC)
@@ -76,7 +76,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir"); ap.add_argument("out")
     ap.add_argument("--stage", type=int, default=1); ap.add_argument("--of", type=int, default=6)
-    ap.add_argument("--rate", default=""); ap.add_argument("--speed", type=float, default=1.5); ap.add_argument("--note", default="")
+    ap.add_argument("--rate", default=""); ap.add_argument("--speed", type=float, default=1.5); ap.add_argument("--note", default=""); ap.add_argument("--label", default="")
     a = ap.parse_args()
     steps = [json.loads(l) for l in open(f"{a.dir}/steps.jsonl")]
     frames = np.fromfile(f"{a.dir}/frames.rgb", dtype=np.uint8).reshape(-1, 224, 256, 3)
@@ -87,7 +87,7 @@ def main():
     xs = [s["x"] for s in steps]; vs = [s["v"] for s in steps]
     x_end = max(xs) + 1
     v_lo, v_hi = min(vs), max(vs)
-    bg = base(a.stage, a.of, a.note)
+    bg = base(a.stage, a.of, a.note, a.label)
     ff = subprocess.Popen(["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", "60", "-i", "-",
                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", a.out], stdin=subprocess.PIPE)
     cache_t, cache_img = -1, None
